@@ -1,0 +1,115 @@
+From 54298b484f6bd28a33901d2b3562dc536c7807e8 Mon Sep 17 00:00:00 2001
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Date: Thu, 18 Sep 2025 17:26:48 +0800
+Subject: [PATCH] net: ethernet: mtk_eth_soc: register NAPI before netdevs
+
+register_netdev() makes an interface visible and permits it to be opened.
+The driver currently creates its shared dummy netdev and registers the NAPI
+contexts only after publishing all Ethernet interfaces.  A sufficiently
+fast open can therefore reach napi_enable() before netif_napi_add().
+
+Create the dummy device and register both NAPI contexts before publishing
+the first interface.  On partial registration failure, only unregister
+netdevs which reached NETREG_REGISTERED.  Keep the NAPI deletion before the
+dummy netdev is freed, and do not attempt it when dummy allocation itself
+failed.
+
+This adapts MediaTek's fix to the Linux 6.18 probe and cleanup paths and
+corrects the failure-ordering issue in the vendor version.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/25.12/files/target/linux/mediatek/patches-6.12/999-eth-07-mtk_eth_soc-fix-panic-issue-with-napi_enable.patch
+Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 44 +++++++++++++---------
+ 1 file changed, 27 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -4882,6 +4882,12 @@ static void mtk_pending_work(struct work
+ 	rtnl_unlock();
+ }
+ 
++static void mtk_napi_del(struct mtk_eth *eth)
++{
++	netif_napi_del(&eth->tx_napi);
++	netif_napi_del(&eth->rx_napi);
++}
++
+ static int mtk_free_dev(struct mtk_eth *eth)
+ {
+ 	int i;
+@@ -4912,7 +4918,8 @@ static int mtk_unreg_dev(struct mtk_eth
+ 		mac = netdev_priv(eth->netdev[i]);
+ 		if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA))
+ 			unregister_netdevice_notifier(&mac->device_notifier);
+-		unregister_netdev(eth->netdev[i]);
++		if (eth->netdev[i]->reg_state == NETREG_REGISTERED)
++			unregister_netdev(eth->netdev[i]);
+ 	}
+ 
+ 	return 0;
+@@ -5884,20 +5891,6 @@ static int mtk_probe(struct platform_dev
+ 		}
+ 	}
+ 
+-	for (i = 0; i < MTK_MAX_DEVS; i++) {
+-		if (!eth->netdev[i])
+-			continue;
+-
+-		err = register_netdev(eth->netdev[i]);
+-		if (err) {
+-			dev_err(eth->dev, "error bringing up device\n");
+-			goto err_deinit_ppe;
+-		} else
+-			netif_info(eth, probe, eth->netdev[i],
+-				   "mediatek frame engine at 0x%08lx, irq %d\n",
+-				   eth->netdev[i]->base_addr, eth->irq[MTK_FE_IRQ_SHARED]);
+-	}
+-
+ 	/* we run 2 devices on the same DMA ring so we need a dummy device
+ 	 * for NAPI to work
+ 	 */
+@@ -5912,6 +5905,20 @@ static int mtk_probe(struct platform_dev
+ 	netif_napi_add(eth->dummy_dev, &eth->tx_napi, mtk_napi_tx);
+ 	netif_napi_add(eth->dummy_dev, &eth->rx_napi, mtk_napi_rx);
+ 
++	for (i = 0; i < MTK_MAX_DEVS; i++) {
++		if (!eth->netdev[i])
++			continue;
++
++		err = register_netdev(eth->netdev[i]);
++		if (err) {
++			dev_err(eth->dev, "error bringing up device\n");
++			goto err_unreg_netdev;
++		}
++		netif_info(eth, probe, eth->netdev[i],
++			   "mediatek frame engine at 0x%08lx, irq %d\n",
++			   eth->netdev[i]->base_addr, eth->irq[MTK_FE_IRQ_SHARED]);
++	}
++
+ 	platform_set_drvdata(pdev, eth);
+ 	schedule_delayed_work(&eth->reset.monitor_work,
+ 			      MTK_DMA_MONITOR_TIMEOUT);
+@@ -5920,6 +5927,10 @@ static int mtk_probe(struct platform_dev
+ 
+ err_unreg_netdev:
+ 	mtk_unreg_dev(eth);
++	if (eth->dummy_dev) {
++		mtk_napi_del(eth);
++		free_netdev(eth->dummy_dev);
++	}
+ err_deinit_ppe:
+ 	mtk_ppe_deinit(eth);
+ 	mtk_mdio_cleanup(eth);
+@@ -5953,8 +5964,7 @@ static void mtk_remove(struct platform_d
+ 	mtk_wed_exit();
+ 	mtk_hw_deinit(eth);
+ 
+-	netif_napi_del(&eth->tx_napi);
+-	netif_napi_del(&eth->rx_napi);
++	mtk_napi_del(eth);
+ 	mtk_cleanup(eth);
+ 	free_netdev(eth->dummy_dev);
+ 	mtk_mdio_cleanup(eth);
