@@ -1,0 +1,77 @@
+From d933c660a042bd291511cba53b9cfb444d49fbaa Mon Sep 17 00:00:00 2001
+From: "chak-kei.lam" <chak-kei.lam@mediatek.com>
+Date: Tue, 20 Jan 2026 16:35:52 +0800
+Subject: [PATCH] net: ethernet: mtk_eth_soc: initialize PPE flow table once
+
+The flow table belongs to the Ethernet controller and is shared by all
+of its PPE instances.  Initializing it inside the PPE loop overwrites the
+first rhashtable allocation on SoCs with multiple PPEs, leaking that
+allocation.  MT7987 has two PPEs and therefore always takes this path.
+
+Initialize the table once after all PPE instances have been created.  If a
+later probe step fails, destroy the initialized table before releasing the
+per-PPE state.  Keep mtk_ppe_deinit() limited to per-PPE objects because it
+is also reached when PPE creation fails before the shared table exists.
+
+This adapts MediaTek's fix to the Linux 6.18 probe error paths.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/25.12/files/target/linux/mediatek/patches-6.12/999-eth-43-mtk_eth_soc-fix-mtk_eth_offload_init-memory-leak.patch
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c     | 10 ++++++----
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h     |  2 +-
+ drivers/net/ethernet/mediatek/mtk_ppe_offload.c |  4 +---
+ 3 files changed, 8 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5884,11 +5884,11 @@ static int mtk_probe(struct platform_dev
+ 				err = -ENOMEM;
+ 				goto err_deinit_ppe;
+ 			}
+-			err = mtk_eth_offload_init(eth, i);
+-
+-			if (err)
+-				goto err_deinit_ppe;
+ 		}
++
++		err = mtk_eth_offload_init(eth);
++		if (err)
++			goto err_deinit_ppe;
+ 	}
+ 
+ 	/* we run 2 devices on the same DMA ring so we need a dummy device
+@@ -5931,6 +5931,8 @@ err_unreg_netdev:
+ 		mtk_napi_del(eth);
+ 		free_netdev(eth->dummy_dev);
+ 	}
++	if (eth->soc->offload_version)
++		rhashtable_destroy(&eth->flow_table);
+ err_deinit_ppe:
+ 	mtk_ppe_deinit(eth);
+ 	mtk_mdio_cleanup(eth);
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1617,7 +1617,7 @@ int mtk_gmac_gephy_path_setup(struct mtk
+ int mtk_gmac_rgmii_path_setup(struct mtk_eth *eth, int mac_id);
+ int mtk_gmac_usxgmii_path_setup(struct mtk_eth *eth, int mac_id);
+ 
+-int mtk_eth_offload_init(struct mtk_eth *eth, u8 id);
++int mtk_eth_offload_init(struct mtk_eth *eth);
+ int mtk_eth_setup_tc(struct net_device *dev, enum tc_setup_type type,
+ 		     void *type_data);
+ int mtk_flow_offload_cmd(struct mtk_eth *eth, struct flow_cls_offload *cls,
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+@@ -715,9 +715,7 @@ int mtk_eth_setup_tc(struct net_device *
+ 	}
+ }
+ 
+-int mtk_eth_offload_init(struct mtk_eth *eth, u8 id)
++int mtk_eth_offload_init(struct mtk_eth *eth)
+ {
+-	if (!eth->ppe[id] || !eth->ppe[id]->foe_table)
+-		return 0;
+ 	return rhashtable_init(&eth->flow_table, &mtk_flow_ht_params);
+ }
