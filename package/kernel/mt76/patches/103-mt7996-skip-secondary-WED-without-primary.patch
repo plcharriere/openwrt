@@ -1,0 +1,34 @@
+From: Rex Lu <rex.lu@mediatek.com>
+Date: Fri, 6 Sep 2024 15:32:05 +0800
+Subject: [PATCH] wifi: mt76: mt7996: skip secondary WED without primary
+
+Do not attach a secondary HIF when the primary WED device is inactive.
+The primary attach is attempted first, so its active state is a per-device
+record of success that does not affect later mt7996-family devices or an
+already configured alternative offload backend.
+
+This avoids the call trace fixed by MediaTek's prerequisite patch without
+turning a single device's attach failure into module-wide policy.
+
+Adapted from MediaTek's 25.12 patch "Fix call trace happened when wed
+attach fail".
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0040-mtk-mt76-mt7996-Fix-call-trace-happened-when-wed-att.patch
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+Index: mt76-2026.09.01~be5ce791/mt7996/mmio.c
+===================================================================
+--- mt76-2026.09.01~be5ce791.orig/mt7996/mmio.c
++++ mt76-2026.09.01~be5ce791/mt7996/mmio.c
+@@ -508,6 +508,9 @@ int mt7996_mmio_wed_init(struct mt7996_d
+ 	if (!wed_enable)
+ 		return 0;
+ 
++	if (hif2 && !mtk_wed_device_active(wed))
++		return 0;
++
+ 	if (hif2)
+ 		wed = &dev->mt76.mmio.wed_hif2;
+ 
