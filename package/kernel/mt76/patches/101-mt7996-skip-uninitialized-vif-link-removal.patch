@@ -1,0 +1,41 @@
+From adfba73fce964122706f12f8ef6674263f68b04c Mon Sep 17 00:00:00 2001
+From: Shayne Chen <shayne.chen@mediatek.com>
+Date: Tue, 21 Jul 2026 18:59:45 +0800
+Subject: [PATCH] wifi: mt76: mt7996: skip uninitialized vif link removal
+
+Changing an interface from legacy to MLD and back can ask the driver to
+remove default link 0 even though no matching link-add operation
+initialized its BSS state.  The default mvif link object always exists,
+but its WCID pointer is NULL in this state, and the removal path
+dereferences it.
+
+Return before deriving link state or touching the WCID when the link was
+not initialized.  This only affects the unmatched link-removal transition;
+links created through the normal add path retain the existing teardown
+behavior.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/commit/c6b206f391358af2fee96389544162838505fd1f
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/main.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -464,8 +464,13 @@ void mt7996_vif_link_remove(struct mt76_
+ 	struct mt7996_vif_link *link = container_of(mlink, struct mt7996_vif_link, mt76);
+ 	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
+ 	struct mt7996_sta_link *msta_link = &link->msta_link;
+-	unsigned int link_id = msta_link->wcid.link_id;
+ 	struct mt7996_phy *phy = mphy->priv;
++	unsigned int link_id;
++
++	if (!mlink->wcid)
++		return;
++
++	link_id = msta_link->wcid.link_id;
+ 
+ 	/* Hw requires to destroy active links tearing down the interface, so
+ 	 * postpone it removing the interface.

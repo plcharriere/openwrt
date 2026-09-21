@@ -1,0 +1,38 @@
+From: Rex Lu <rex.lu@mediatek.com>
+Date: Tue, 8 Apr 2025 14:25:50 +0800
+Subject: [PATCH] net: ethernet: mtk_wed: avoid WED 3.1 token-status false alarms
+
+MT7987 WED 3.1 only enables RX_DRV_COHERENT in its external interrupt
+mask.  The interrupt handler nevertheless classifies TKID_WO_PYLD as an
+error for every WED v3-or-newer device.  That status bit can be latched
+during normal PPE-to-WDMA Wi-Fi forwarding, producing a large number of
+misleading "error status=00000002" messages even though the bit is not an
+enabled WED 3.1 error interrupt.
+
+Use the same WED 3.1 status mask when consuming and reporting the status
+register.  Keep the existing WED v3 handling intact so this MT7987 fix does
+not change diagnostics on other SoCs.
+
+This is a narrow Linux 6.18 adaptation of MediaTek feed patch
+999-wed-14-refactor-mtk_wed_irq_get-to-avoid-wed-status-false-a.patch.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/25.12/files/target/linux/mediatek/patches-6.12/999-wed-14-refactor-mtk_wed_irq_get-to-avoid-wed-status-false-a.patch
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_wed.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -3012,7 +3012,9 @@ mtk_wed_irq_get(struct mtk_wed_device *d
+ {
+ 	u32 val, ext_mask;
+ 
+-	if (mtk_wed_is_v3_or_greater(dev->hw))
++	if (mtk_wed_is_v3_1(dev->hw))
++		ext_mask = MTK_WED_EXT_INT_STATUS_RX_DRV_COHERENT;
++	else if (mtk_wed_is_v3(dev->hw))
+ 		ext_mask = MTK_WED_EXT_INT_STATUS_RX_DRV_COHERENT |
+ 			   MTK_WED_EXT_INT_STATUS_TKID_WO_PYLD;
+ 	else
