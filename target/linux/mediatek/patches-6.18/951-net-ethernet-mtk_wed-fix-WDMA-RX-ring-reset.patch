@@ -1,0 +1,27 @@
+From: developer <developer@mediatek.com>
+Date: Fri, 27 Sep 2024 16:58:22 +0800
+Subject: [PATCH] net: ethernet: mtk_wed: fix WDMA RX ring reset
+
+The descriptor test in mtk_wdma_rx_reset() is inverted: it skips every
+allocated ring and writes the CPU index only for absent rings.  Reset the
+index of allocated rings instead.  This is the missing part of MediaTek's
+WDMA RX recovery fix; the prefetch index and FIFO reset from that patch is
+already performed by the current ring setup path.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/25.12/files/target/linux/mediatek/patches-6.12/999-wed-03-fix-wdma-rx-hang-on-wed1-after-SER.patch
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_wed.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -277,7 +277,7 @@ mtk_wdma_rx_reset(struct mtk_wed_device
+ 	wdma_w32(dev, MTK_WDMA_RESET_IDX, 0);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dev->rx_wdma); i++) {
+-		if (dev->rx_wdma[i].desc)
++		if (!dev->rx_wdma[i].desc)
+ 			continue;
+ 
+ 		wdma_w32(dev,
