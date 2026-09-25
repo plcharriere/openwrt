@@ -1,0 +1,22 @@
+From: developer <developer@mediatek.com>
+Date: Mon, 1 Jun 2026 13:47:30 +0800
+Subject: [PATCH] net: ethernet: mtk_wed: shorten busy polling interval
+
+Use a 1 ms interval and a 100 ms total timeout when waiting for WED blocks
+to become idle.  The old 15 ms interval produces a 1.5 second timeout for
+each poll and can stretch L1 SER recovery to about five seconds under heavy
+bidirectional traffic, long enough for stations to disconnect.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/25.12/files/target/linux/mediatek/patches-6.12/999-wed-20-refactor-check-wed-module-busy-time.patch
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -296,7 +296,7 @@ mtk_wed_check_busy(struct mtk_wed_device *dev, u32 reg, u32 mask)
+ static int
+ mtk_wed_poll_busy(struct mtk_wed_device *dev, u32 reg, u32 mask)
+ {
+-	int sleep = 15000;
++	int sleep = 1000;
+ 	int timeout = 100 * sleep;
+ 	u32 val;
