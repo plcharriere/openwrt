@@ -1,0 +1,71 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 26 Sep 2026 00:38:34 +0900
+Subject: [PATCH] wifi: mt76: fix mt7996 RX NAPI teardown
+
+mt76_dma_init() deliberately does not initialize some NAPI instances for
+WED RRO queues, but mt76_dma_cleanup() tries to delete every RX NAPI
+instance.  On MT7987 with MT7990 and WED 3.1 this reaches netif_napi_del()
+with an uninitialized object and panics during mt7996e module removal.
+
+The remaining mt7996 RX NAPI instances are still enabled when their page
+pools are destroyed, which also triggers the page-pool race warning.
+
+Nicolas Cavallari's upstream fix disabled every mt76 RX NAPI in the shared
+cleanup path and skipped deletion based on the WED RRO queue role.  It was
+reverted because mt7921 and mt7925 already disable their NAPI instances,
+and a second napi_disable() can hang.
+
+Use NAPI_STATE_LISTED as the authoritative initialized-state test in the
+common deletion path.  Move the disable operation into
+mt7996_dma_cleanup(), where the teardown path does not otherwise disable
+these instances, and apply the same state test there.  Iterate the complete
+NAPI array rather than mt76_for_each_q_rx(), since descriptor-less queues
+can still own a registered NAPI instance.  This also handles a non-WED
+mt7996 instance correctly instead of assuming that every queue with a WED
+RRO role was left uninitialized.
+
+Fixes: 7dd72bbd6f51 ("wifi: mt76: Fix memory leak destroying device")
+Link: https://github.com/openwrt/mt76/commit/332bbe9b2784bea2fd2b00fceb8eacf0fba06728
+Link: https://github.com/openwrt/mt76/commit/6d1c6a758a4c0a690ee56cb849387dfa262fdb17
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ dma.c        | 6 +++++-
+ mt7996/dma.c | 10 ++++++++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+--- a/dma.c
++++ b/dma.c
+@@ -1218,7 +1218,11 @@ void mt76_dma_cleanup(struct mt76_dev *dev)
++	for (i = 0; i < ARRAY_SIZE(dev->q_rx); i++) {
++		if (test_bit(NAPI_STATE_LISTED, &dev->napi[i].state))
++			netif_napi_del(&dev->napi[i]);
++	}
++
+ 	mt76_for_each_q_rx(dev, i) {
+ 		struct mt76_queue *q = &dev->q_rx[i];
+ 
+-		netif_napi_del(&dev->napi[i]);
+ 		mt76_dma_rx_cleanup(dev, q);
+ 
+ 		page_pool_destroy(q->page_pool);
+--- a/mt7996/dma.c
++++ b/mt7996/dma.c
+@@ -1093,7 +1093,17 @@ void mt7996_dma_reset(struct mt7996_dev
+ 
+ void mt7996_dma_cleanup(struct mt7996_dev *dev)
+ {
++	int i;
++
+ 	mt7996_dma_disable(dev, true);
+ 
++	for (i = 0; i < ARRAY_SIZE(dev->mt76.q_rx); i++) {
++		if (!test_bit(NAPI_STATE_LISTED,
++			      &dev->mt76.napi[i].state))
++			continue;
++
++		napi_disable(&dev->mt76.napi[i]);
++	}
++
+ 	mt76_dma_cleanup(&dev->mt76);
+ }

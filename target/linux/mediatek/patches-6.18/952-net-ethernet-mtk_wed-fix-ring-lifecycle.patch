@@ -1,0 +1,146 @@
+From: developer <developer@mediatek.com>
+Date: Fri, 12 Dec 2025 16:47:10 +0800
+Subject: [PATCH] net: ethernet: mtk_wed: fix ring allocation lifecycle
+
+Repeated setup can allocate a second coherent DMA ring over an existing
+ring pointer, leaking the first allocation and leaving ownership ambiguous.
+Allocate WED and WDMA rings only when their descriptor pointer is empty,
+and initialize both WDMA RX rings through one consistent setup path.
+
+Free the WED-owned RX and WDMA TX rings on detach.  MediaTek's cleanup
+patch gates this on MTK_WED_RING_CONFIGURED, but the Linux 6.18 allocation
+state is already represented authoritatively by ring->desc and
+mtk_wed_free_ring() safely ignores an empty ring.  This also avoids the
+vendor patch's erroneous use of tx_ring[i].flags while freeing rx_ring[i].
+
+Preserve the old first-allocation behaviour by resetting the hardware CPU
+index when a ring is newly allocated, as well as during an explicit reset.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/25.12/files/target/linux/mediatek/patches-6.12/999-wed-04-Fix-reinsert-wifi-module-cause-memory-leak-issue.patch
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/25.12/files/target/linux/mediatek/patches-6.12/999-wed-16-refactor-wdma-init-flow-to-avoid-double-init.patch
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -1042,6 +1042,14 @@ mtk_wed_free_ring(struct mtk_wed_device *dev, struct mtk_wed_ring *ring)
+ static void
+ mtk_wed_free_rx_rings(struct mtk_wed_device *dev)
+ {
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(dev->rx_ring); i++)
++		mtk_wed_free_ring(dev, &dev->rx_ring[i]);
++
++	for (i = 0; i < ARRAY_SIZE(dev->tx_wdma); i++)
++		mtk_wed_free_ring(dev, &dev->tx_wdma[i]);
++
+ 	mtk_wed_free_rx_buffer(dev);
+ 	mtk_wed_free_ring(dev, &dev->rro.ring);
+ }
+@@ -2229,29 +2237,37 @@ mtk_wed_ring_alloc(struct mtk_wed_device *dev, struct mtk_wed_ring *ring,
+ }
+ 
+ static int
+-mtk_wed_wdma_rx_ring_setup(struct mtk_wed_device *dev, int idx, int size,
+-			   bool reset)
++mtk_wed_wdma_rx_ring_setup(struct mtk_wed_device *dev, int size, bool reset)
+ {
+ 	struct mtk_wed_ring *wdma;
++	int idx;
++
++	for (idx = 0; idx < ARRAY_SIZE(dev->rx_wdma); idx++) {
++		bool init = false;
++
++		wdma = &dev->rx_wdma[idx];
++		if (!wdma->desc) {
++			if (mtk_wed_ring_alloc(dev, wdma,
++					       MTK_WED_WDMA_RING_SIZE,
++					       dev->hw->soc->wdma_desc_size,
++					       true))
++				return -ENOMEM;
++			init = true;
++		}
+ 
+-	if (idx >= ARRAY_SIZE(dev->rx_wdma))
+-		return -EINVAL;
+-
+-	wdma = &dev->rx_wdma[idx];
+-	if (!reset && mtk_wed_ring_alloc(dev, wdma, MTK_WED_WDMA_RING_SIZE,
+-					 dev->hw->soc->wdma_desc_size, true))
+-		return -ENOMEM;
+-
+-	wdma_w32(dev, MTK_WDMA_RING_RX(idx) + MTK_WED_RING_OFS_BASE,
+-		 wdma->desc_phys);
+-	wdma_w32(dev, MTK_WDMA_RING_RX(idx) + MTK_WED_RING_OFS_COUNT,
+-		 size);
+-	wdma_w32(dev, MTK_WDMA_RING_RX(idx) + MTK_WED_RING_OFS_CPU_IDX, 0);
++		wdma_w32(dev, MTK_WDMA_RING_RX(idx) + MTK_WED_RING_OFS_BASE,
++			 wdma->desc_phys);
++		wdma_w32(dev, MTK_WDMA_RING_RX(idx) + MTK_WED_RING_OFS_COUNT,
++			 size);
++		if (init || reset)
++			wdma_w32(dev, MTK_WDMA_RING_RX(idx) +
++				 MTK_WED_RING_OFS_CPU_IDX, 0);
+ 
+-	wed_w32(dev, MTK_WED_WDMA_RING_RX(idx) + MTK_WED_RING_OFS_BASE,
+-		wdma->desc_phys);
+-	wed_w32(dev, MTK_WED_WDMA_RING_RX(idx) + MTK_WED_RING_OFS_COUNT,
+-		size);
++		wed_w32(dev, MTK_WED_WDMA_RING_RX(idx) + MTK_WED_RING_OFS_BASE,
++			wdma->desc_phys);
++		wed_w32(dev, MTK_WED_WDMA_RING_RX(idx) + MTK_WED_RING_OFS_COUNT,
++			size);
++	}
+ 
+ 	return 0;
+ }
+@@ -2266,8 +2282,8 @@ mtk_wed_wdma_tx_ring_setup(struct mtk_wed_device *dev, int idx, int size,
+ 		return -EINVAL;
+ 
+ 	wdma = &dev->tx_wdma[idx];
+-	if (!reset && mtk_wed_ring_alloc(dev, wdma, MTK_WED_WDMA_RING_SIZE,
+-					 dev->hw->soc->wdma_desc_size, true))
++	if (!wdma->desc && mtk_wed_ring_alloc(dev, wdma, MTK_WED_WDMA_RING_SIZE,
++					      dev->hw->soc->wdma_desc_size, true))
+ 		return -ENOMEM;
+ 
+ 	if (mtk_wed_is_v3_or_greater(dev->hw)) {
+@@ -2743,10 +2759,6 @@ mtk_wed_start(struct mtk_wed_device *dev, u32 irq_mask)
+ 	if (mtk_wed_get_rx_capa(dev) && mtk_wed_rx_buffer_alloc(dev))
+ 		return;
+ 
+-	for (i = 0; i < ARRAY_SIZE(dev->rx_wdma); i++)
+-		if (!dev->rx_wdma[i].desc)
+-			mtk_wed_wdma_rx_ring_setup(dev, i, 16, false);
+-
+ 	if (dev->wlan.hw_rro) {
+ 		for (i = 0; i < MTK_WED_RX_PAGE_QUEUES; i++) {
+ 			u32 addr = MTK_WED_RRO_MSDU_PG_CTRL0(i) +
+@@ -2906,12 +2918,11 @@ mtk_wed_tx_ring_setup(struct mtk_wed_device *dev, int idx, void __iomem *regs,
+ 	if (WARN_ON(idx >= ARRAY_SIZE(dev->tx_ring)))
+ 		return -EINVAL;
+ 
+-	if (!reset && mtk_wed_ring_alloc(dev, ring, MTK_WED_TX_RING_SIZE,
+-					 sizeof(*ring->desc), true))
++	if (!ring->desc && mtk_wed_ring_alloc(dev, ring, MTK_WED_TX_RING_SIZE,
++					      sizeof(*ring->desc), true))
+ 		return -ENOMEM;
+ 
+-	if (mtk_wed_wdma_rx_ring_setup(dev, idx, MTK_WED_WDMA_RING_SIZE,
+-				       reset))
++	if (mtk_wed_wdma_rx_ring_setup(dev, MTK_WED_WDMA_RING_SIZE, reset))
+ 		return -ENOMEM;
+ 
+ 	ring->reg_base = MTK_WED_RING_TX(idx);
+@@ -2981,8 +2992,8 @@ mtk_wed_rx_ring_setup(struct mtk_wed_device *dev, int idx, void __iomem *regs,
+ 	if (WARN_ON(idx >= ARRAY_SIZE(dev->rx_ring)))
+ 		return -EINVAL;
+ 
+-	if (!reset && mtk_wed_ring_alloc(dev, ring, MTK_WED_RX_RING_SIZE,
+-					 sizeof(*ring->desc), false))
++	if (!ring->desc && mtk_wed_ring_alloc(dev, ring, MTK_WED_RX_RING_SIZE,
++					      sizeof(*ring->desc), false))
+ 		return -ENOMEM;
+ 
+ 	if (mtk_wed_wdma_tx_ring_setup(dev, idx, MTK_WED_WDMA_RING_SIZE,

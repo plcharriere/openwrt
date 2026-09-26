@@ -1,0 +1,41 @@
+From: Peter Chiu <chui-hao.chiu@mediatek.com>
+Date: Thu, 13 Nov 2025 11:27:06 +0800
+Subject: [PATCH] wifi: mt76: mt7996: use dedicated MT7990 TX-free ring for WED
+
+Current mt76 routes MT7990 TX-free notifications through dedicated WFDMA
+RX ring 6 and interrupt bit 14.  The MT7987 WED 3.1 reference patch was
+based on an older tree and still points WED at the former WA event ring 2
+and interrupt bit 2.
+
+Pointing WED at the old ring leaves it disconnected from the TX-free path
+configured by mt7996_dma_config() and mt7996_dma_init().  Select the same
+dedicated MT7990 ring and interrupt used by the non-WED path so WED can
+receive the device's completion notifications.
+
+This is restricted to MT7990.  Keep the existing MT7996 TXFREE0 and MT7992
+WA-ring mappings unchanged.
+
+This is adapted from MediaTek's MT7990 WED/RRO configuration patch.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0048-mtk-mt76-mt7996-add-configuration-to-suppot-wed-and-.patch
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+Index: mt76-2026.09.01~be5ce791/mt7996/mmio.c
+===================================================================
+--- mt76-2026.09.01~be5ce791.orig/mt7996/mmio.c
++++ mt76-2026.09.01~be5ce791/mt7996/mmio.c
+@@ -661,6 +661,12 @@ int mt7996_mmio_wed_init(struct mt7996_d
+ 						 MT_RXQ_RING_BASE(0) +
+ 						 MT7996_RXQ_TXFREE0 * MT_RING_SIZE;
+ 			wed->wlan.txfree_tbit = ffs(MT_INT_RX_TXFREE_MAIN) - 1;
++		} else if (is_mt7990(&dev->mt76)) {
++			wed->wlan.wpdma_txfree = wed->wlan.phy_base +
++						 MT_RXQ_RING_BASE(0) +
++						 MT7990_RXQ_TXFREE0 * MT_RING_SIZE;
++			wed->wlan.txfree_tbit =
++				ffs(MT_INT_RX_TXFREE_BAND0_MT7990) - 1;
+ 		} else {
+ 			wed->wlan.txfree_tbit = ffs(MT_INT_RX_DONE_WA_MAIN) - 1;
+ 			wed->wlan.wpdma_txfree = wed->wlan.phy_base +
