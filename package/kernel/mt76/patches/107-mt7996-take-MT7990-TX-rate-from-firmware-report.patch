@@ -27,6 +27,13 @@ UNI_ALL_STA_TXRX_RATE report and stop TX status from overwriting it.  TX
 status statistics are unchanged, and MT7996 and MT7992 keep the current
 behaviour.
 
+Right after association, before any data frame has been sent, the
+firmware reports OFDM 6 Mbit/s.  Unicast data to an HT or newer station
+uses HT or newer rates, so ignore legacy rates in the report for such
+stations and keep the current rate.  Until the first real rate is
+reported, the rate stays unset, so AQL does not throttle the first
+transfer, as before this change.
+
 This replaces the previous rule, which ignored non-WED statuses only while
 WED was active.
 
@@ -55,10 +62,33 @@ Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
  	if (skb)
 --- a/mt7996/mcu.c
 +++ b/mt7996/mcu.c
-@@ -644,6 +644,121 @@ mt7996_mcu_update_tx_gi(struct rate_info
+@@ -644,6 +644,152 @@ mt7996_mcu_update_tx_gi(struct rate_info
  	return 0;
  }
  
++static bool
++mt7996_mcu_wcid_has_ht(struct mt76_wcid *wcid)
++{
++	struct ieee80211_link_sta *link_sta;
++	struct ieee80211_sta *sta;
++	bool ret = false;
++
++	sta = wcid_to_sta(wcid);
++	if (!sta)
++		return false;
++
++	rcu_read_lock();
++	link_sta = rcu_dereference(sta->link[wcid->link_id]);
++	if (link_sta)
++		ret = link_sta->ht_cap.ht_supported ||
++		      link_sta->vht_cap.vht_supported ||
++		      link_sta->he_cap.has_he ||
++		      link_sta->eht_cap.has_eht;
++	rcu_read_unlock();
++
++	return ret;
++}
++
 +static int
 +mt7996_mcu_update_tx_rate(struct mt7996_dev *dev, struct mt76_wcid *wcid,
 +			  struct all_sta_trx_rate *mcu_rate)
@@ -77,6 +107,14 @@ Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
 +	switch (mode) {
 +	case MT_PHY_TYPE_CCK:
 +	case MT_PHY_TYPE_OFDM:
++		/* Data for an HT or newer station uses HT or newer rates.
++		 * Before the first data frame the firmware reports OFDM
++		 * 6 Mbit/s, which would make AQL throttle the first transfer,
++		 * so keep the current rate.
++		 */
++		if (mt7996_mcu_wcid_has_ht(wcid))
++			return 0;
++
 +		if (!mphy->chandef.chan)
 +			return -EINVAL;
 +
@@ -177,7 +215,7 @@ Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
  static void
  mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
  {
-@@ -667,6 +782,14 @@ mt7996_mcu_rx_all_sta_info_event(struct
+@@ -667,6 +813,14 @@ mt7996_mcu_rx_all_sta_info_event(struct
  			if (!wcid)
  				break;
  
