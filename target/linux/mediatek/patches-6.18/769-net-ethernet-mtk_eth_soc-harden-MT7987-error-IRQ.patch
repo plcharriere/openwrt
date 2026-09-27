@@ -1,0 +1,134 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Mon, 28 Sep 2026 20:05:00 +0900
+Subject: [PATCH] net: ethernet: mtk_eth_soc: harden MT7987 error IRQ
+
+Do not treat free-queue pressure as a fatal Frame Engine error.  MediaTek
+removed FQ_EMPTY from its recovery conditions because it can be raised
+while the PSE is still active when buffers fall below the drop threshold.
+
+Do not reset NETSYS immediately for the remaining error bits either.  The
+upstream recovery policy resets only when a TX watchdog timeout confirms
+that one of these status bits accompanies a stalled transmit path.  Mask
+an asserted source to prevent an interrupt storm, but leave its status
+latched so mtk_tx_timeout() can make that decision.  Warm reset clears and
+re-enables the sources.
+
+Clear a stale FQ_EMPTY status during initialization and recovery without
+enabling its interrupt.  Also exclude FQ_EMPTY from the MT7987 TX-timeout
+check, since normal queue pressure can otherwise remain latched and
+corroborate an unrelated later timeout.  Preserve the existing timeout
+policy for SoCs without the MT7987 miscellaneous IRQ.
+
+Serialize updates to the shared Frame Engine interrupt-enable register.
+Disable and synchronize the miscellaneous IRQ across warm reset so an
+in-flight handler cannot restore a stale enable mask after the hardware is
+reinitialized.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/commit/a8527f94518357db2a969fe008e8eed9a5fdbf38
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 37 +++++++++++++++++++++++++----
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h |  3 +--
+ 2 files changed, 26 insertions(+), 14 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -106,9 +106,8 @@
+ #define MTK_FE_INT_TSO_ALIGN	BIT(14)
+ #define MTK_FE_INT_RFIFO_OV	BIT(18)
+ #define MTK_FE_INT_RFIFO_UF	BIT(19)
+-#define MTK_FE_INT_ERROR_MASK	(MTK_FE_INT_FQ_EMPTY | \
+-				 MTK_FE_INT_TSO_FAIL | \
++#define MTK_FE_INT_ERROR_MASK	(MTK_FE_INT_TSO_FAIL | \
+ 				 MTK_FE_INT_TSO_ILLEGAL | \
+ 				 MTK_FE_INT_TSO_ALIGN | \
+ 				 MTK_FE_INT_RFIFO_OV | \
+ 				 MTK_FE_INT_RFIFO_UF)
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -3903,10 +3903,15 @@ static void mtk_dma_free(struct mtk_eth
+ static bool mtk_hw_reset_check(struct mtk_eth *eth)
+ {
+ 	u32 val = mtk_r32(eth, MTK_INT_STATUS2);
++	u32 mask = MTK_FE_INT_ERROR_MASK;
+ 
+-	return (val & MTK_FE_INT_FQ_EMPTY) || (val & MTK_FE_INT_RFIFO_UF) ||
+-	       (val & MTK_FE_INT_RFIFO_OV) || (val & MTK_FE_INT_TSO_FAIL) ||
+-	       (val & MTK_FE_INT_TSO_ALIGN) || (val & MTK_FE_INT_TSO_ILLEGAL);
++	/* Preserve the existing policy on other SoCs.  MT7987's misc IRQ does
++	 * not enable FQ_EMPTY because normal queue pressure can assert it.
++	 */
++	if (!eth->soc->has_misc_irq)
++		mask |= MTK_FE_INT_FQ_EMPTY;
++
++	return val & mask;
+ }
+ 
+ static void mtk_tx_timeout(struct net_device *dev, unsigned int txqueue)
+@@ -4046,26 +4046,28 @@ static irqreturn_t mtk_handle_irq_misc(i
+ 	if (!status)
+ 		return IRQ_NONE;
+ 
+-	mtk_w32(eth, status, MTK_INT_STATUS2);
++	/* Keep the status latched for mtk_tx_timeout().  Mask asserted sources
++	 * so a persistent fault cannot storm the CPU before the watchdog has
++	 * decided whether recovery is necessary.
++	 */
++	mtk_fe_m32(eth, status, 0, MTK_FE_INT_ENABLE);
+ 	dev_err_ratelimited(eth->dev,
+ 			    "Frame Engine error interrupt: %#x\n", status);
+ 
+-	if (!test_bit(MTK_RESETTING, &eth->state))
+-		schedule_work(&eth->pending_work);
+-
+ 	return IRQ_HANDLED;
+ }
+ 
+ static void mtk_misc_irq_enable(struct mtk_eth *eth)
+ {
+-	mtk_w32(eth, MTK_FE_INT_ERROR_MASK, MTK_INT_STATUS2);
++	mtk_w32(eth, MTK_FE_INT_ERROR_MASK | MTK_FE_INT_FQ_EMPTY,
++		MTK_INT_STATUS2);
+-	mtk_m32(eth, MTK_FE_INT_ERROR_MASK, MTK_FE_INT_ERROR_MASK,
+-		MTK_FE_INT_ENABLE);
++	mtk_fe_m32(eth, MTK_FE_INT_ERROR_MASK, MTK_FE_INT_ERROR_MASK,
++		   MTK_FE_INT_ENABLE);
+ }
+ 
+ static void mtk_misc_irq_disable(struct mtk_eth *eth)
+ {
+-	mtk_m32(eth, MTK_FE_INT_ERROR_MASK, 0, MTK_FE_INT_ENABLE);
++	mtk_fe_m32(eth, MTK_FE_INT_ERROR_MASK, 0, MTK_FE_INT_ENABLE);
+ }
+ 
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+@@ -5183,7 +5185,7 @@ static void mtk_prepare_for_reset(struct mtk_eth *eth)
+ 		mtk_ppe_prepare_reset(eth->ppe[i]);
+ 
+ 	/* disable NETSYS interrupts */
+-	mtk_w32(eth, 0, MTK_FE_INT_ENABLE);
++	mtk_fe_m32(eth, ~0, 0, MTK_FE_INT_ENABLE);
+ 
+ 	/* force link down GMAC */
+ 	for (i = 0; i < 2; i++) {
+@@ -5203,6 +5205,9 @@ static void mtk_pending_work(struct work_struct *work)
+ 	rtnl_lock();
+ 	set_bit(MTK_RESETTING, &eth->state);
+ 
++	if (eth->soc->has_misc_irq)
++		disable_irq(eth->irq_misc);
++
+ 	mtk_hw_dump(eth);
+ 
+ 	mtk_prepare_for_reset(eth);
+@@ -5268,6 +5273,9 @@ static void mtk_pending_work(struct work_struct *work)
+ 	}
+ 
+ 	clear_bit(MTK_RESETTING, &eth->state);
++
++	if (eth->soc->has_misc_irq)
++		enable_irq(eth->irq_misc);
+ 
+ 	mtk_wed_fe_reset_complete();
+ 

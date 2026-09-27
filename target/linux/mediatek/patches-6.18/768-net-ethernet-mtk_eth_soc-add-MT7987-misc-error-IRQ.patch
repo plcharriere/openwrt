@@ -1,0 +1,246 @@
+From 13c73de25ef3f53f5dabdc2f2b410f3aaccbcd0d Mon Sep 17 00:00:00 2001
+From: developer <developer@mediatek.com>
+Date: Fri, 28 Aug 2026 20:59:10 +0800
+Subject: [PATCH] net: ethernet: mtk_eth_soc: add MT7987 misc error IRQ
+
+The MT7987 Frame Engine exposes fatal conditions through its fourth
+interrupt, but the current driver only requests the TX and RX interrupts.
+Consequently, free-queue exhaustion, TSO errors and RFIFO errors are only
+noticed later if the TX watchdog happens to inspect the status register.
+
+Request the fe3 interrupt on MT7987 and route the existing six error status
+bits to it. Acknowledge asserted enabled bits in the handler, then schedule
+the driver's existing reset work immediately. Clear stale status before
+enabling the interrupt and restore it after a warm reset.
+
+Keep the extra IRQ separate from the existing TX/RX array. Its logical
+indices do not match MediaTek's later RSS-based driver. Restrict the new
+behavior through SoC data so other MediaTek platforms retain their current
+interrupt layout.
+
+Keep the source masked until probe completes. On removal, disable the Linux
+IRQ synchronously and mask the source before cancelling reset work or
+freeing network devices, so an error cannot queue recovery against released
+state even if in-flight reset work temporarily rearms the hardware.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/commit/13c73de25ef3f53f5dabdc2f2b410f3aaccbcd0d
+[plcharriere: adapt the IRQ layout and recovery policy to Linux 6.18,
+restrict the feature to MT7987, and handle initialisation and teardown]
+Assisted-by: Codex:gpt-5.6-sol
+Co-developed-by: Paul-Louis Charrière <plcharriere@gmail.com>
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 84 +++++++++++++++++++++++++++--
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h | 12 ++++
+ 2 files changed, 94 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -104,6 +104,12 @@
+ #define MTK_FE_INT_TSO_ALIGN	BIT(14)
+ #define MTK_FE_INT_RFIFO_OV	BIT(18)
+ #define MTK_FE_INT_RFIFO_UF	BIT(19)
++#define MTK_FE_INT_ERROR_MASK	(MTK_FE_INT_FQ_EMPTY | \
++				 MTK_FE_INT_TSO_FAIL | \
++				 MTK_FE_INT_TSO_ILLEGAL | \
++				 MTK_FE_INT_TSO_ALIGN | \
++				 MTK_FE_INT_RFIFO_OV | \
++				 MTK_FE_INT_RFIFO_UF)
+ #define MTK_GDM1_AF		BIT(28)
+ #define MTK_GDM2_AF		BIT(29)
+ 
+@@ -112,6 +118,8 @@
+ 
+ /* Frame Engine Interrupt Grouping Register */
+ #define MTK_FE_INT_GRP		0x20
++#define MTK_FE_INT_GRP_MISC	GENMASK(3, 0)
++#define MTK_FE_INT_GRP_MISC_ID	3
+ 
+ /* CDMP Ingress Control Register */
+ #define MTK_CDMQ_IG_CTRL	0x1400
+@@ -1298,6 +1306,8 @@
+  * @foe_entry_size		Foe table entry size.
+  * @has_accounting		Bool indicating support for accounting of
+  *				offloaded flows.
++ * @has_misc_irq		Bool indicating support for the Frame Engine
++ *				miscellaneous error interrupt.
+  * @desc_shift			Tx/Rx DMA descriptor size (in power-of-2).
+  * @irq_done_mask		Rx irq done register mask.
+  * @dma_l4_valid		Rx DMA valid register mask.
+@@ -1318,6 +1328,7 @@
+ 	u16		foe_entry_size;
+ 	netdev_features_t hw_features;
+ 	bool		has_accounting;
++	bool		has_misc_irq;
+ 	bool		disable_pll_modes;
+ 	struct {
+ 		u32	desc_shift;
+@@ -1402,6 +1413,7 @@
+ 	struct net_device		*netdev[MTK_MAX_DEVS];
+ 	struct mtk_mac			*mac[MTK_MAX_DEVS];
+ 	int				irq[MTK_FE_IRQ_NUM];
++	int				irq_misc;
+ 	u32				msg_enable;
+ 	unsigned long			sysclk;
+ 	struct regmap			*ethsys;
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -3809,7 +3809,24 @@
+ 
+ 	schedule_work(&eth->pending_work);
+ }
++
++static int mtk_get_misc_irq(struct platform_device *pdev,
++			    struct mtk_eth *eth)
++{
++	if (!eth->soc->has_misc_irq)
++		return 0;
+ 
++	eth->irq_misc = platform_get_irq_byname_optional(pdev, "fe3");
++	if (eth->irq_misc == -ENXIO)
++		eth->irq_misc = platform_get_irq(pdev, 3);
++
++	if (eth->irq_misc < 0)
++		return dev_err_probe(&pdev->dev, eth->irq_misc,
++				     "Error requesting FE misc IRQ\n");
++
++	return 0;
++}
++
+ static int mtk_get_irqs(struct platform_device *pdev, struct mtk_eth *eth)
+ {
+ 	int i;
+@@ -3818,7 +3835,7 @@
+ 	eth->irq[MTK_FE_IRQ_TX] = platform_get_irq_byname_optional(pdev, "fe1");
+ 	eth->irq[MTK_FE_IRQ_RX] = platform_get_irq_byname_optional(pdev, "fe2");
+ 	if (eth->irq[MTK_FE_IRQ_TX] >= 0 && eth->irq[MTK_FE_IRQ_RX] >= 0)
+-		return 0;
++		return mtk_get_misc_irq(pdev, eth);
+ 
+ 	/* only use legacy mode if platform_get_irq_byname_optional returned -ENXIO */
+ 	if (eth->irq[MTK_FE_IRQ_TX] != -ENXIO)
+@@ -3854,7 +3871,7 @@
+ 		}
+ 	}
+ 
+-	return 0;
++	return mtk_get_misc_irq(pdev, eth);
+ }
+ 
+ static irqreturn_t mtk_handle_irq_rx(int irq, void *_eth)
+@@ -3898,10 +3915,43 @@
+ 		if (mtk_r32(eth, reg_map->tx_irq_status) & MTK_TX_DONE_INT)
+ 			mtk_handle_irq_tx(irq, _eth);
+ 	}
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t mtk_handle_irq_misc(int irq, void *_eth)
++{
++	struct mtk_eth *eth = _eth;
++	u32 status;
++
++	status = mtk_r32(eth, MTK_INT_STATUS2);
++	status &= mtk_r32(eth, MTK_FE_INT_ENABLE);
++	status &= MTK_FE_INT_ERROR_MASK;
++	if (!status)
++		return IRQ_NONE;
++
++	mtk_w32(eth, status, MTK_INT_STATUS2);
++	dev_err_ratelimited(eth->dev,
++			    "Frame Engine error interrupt: %#x\n", status);
++
++	if (!test_bit(MTK_RESETTING, &eth->state))
++		schedule_work(&eth->pending_work);
+ 
+ 	return IRQ_HANDLED;
+ }
+ 
++static void mtk_misc_irq_enable(struct mtk_eth *eth)
++{
++	mtk_w32(eth, MTK_FE_INT_ERROR_MASK, MTK_INT_STATUS2);
++	mtk_m32(eth, MTK_FE_INT_ERROR_MASK, MTK_FE_INT_ERROR_MASK,
++		MTK_FE_INT_ENABLE);
++}
++
++static void mtk_misc_irq_disable(struct mtk_eth *eth)
++{
++	mtk_m32(eth, MTK_FE_INT_ERROR_MASK, 0, MTK_FE_INT_ENABLE);
++}
++
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ static void mtk_poll_controller(struct net_device *dev)
+ {
+@@ -4780,6 +4830,17 @@
+ 	mtk_w32(eth, MTK_TX_DONE_INT, reg_map->qdma.int_grp);
+ 	mtk_w32(eth, eth->soc->rx.irq_done_mask, reg_map->qdma.int_grp + 4);
+ 	mtk_w32(eth, 0x21021000, MTK_FE_INT_GRP);
++	if (eth->soc->has_misc_irq) {
++		mtk_m32(eth, MTK_FE_INT_GRP_MISC,
++			FIELD_PREP(MTK_FE_INT_GRP_MISC,
++				   MTK_FE_INT_GRP_MISC_ID),
++			MTK_FE_INT_GRP);
++
++		if (reset)
++			mtk_misc_irq_enable(eth);
++		else
++			mtk_misc_irq_disable(eth);
++	}
+ 
+ 	if (mtk_is_netsys_v3_or_greater(eth)) {
+ 		/* PSE dummy page mechanism */
+@@ -4882,6 +4943,9 @@
+ 	if (!test_and_clear_bit(MTK_HW_INIT, &eth->state))
+ 		return 0;
+ 
++	if (eth->soc->has_misc_irq)
++		mtk_misc_irq_disable(eth);
++
+ 	mtk_clk_disable(eth);
+ 
+ 	pm_runtime_put_sync(eth->dev);
+@@ -6024,6 +6088,14 @@
+ 	}
+ 	if (err)
+ 		goto err_free_dev;
++
++	if (eth->soc->has_misc_irq) {
++		err = devm_request_irq(eth->dev, eth->irq_misc,
++				       mtk_handle_irq_misc, 0,
++				       dev_name(eth->dev), eth);
++		if (err)
++			goto err_free_dev;
++	}
+ 
+ 	/* No MT7628/88 support yet */
+ 	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_SOC_MT7628)) {
+@@ -6082,6 +6154,8 @@
+ 	}
+ 
+ 	platform_set_drvdata(pdev, eth);
++	if (eth->soc->has_misc_irq)
++		mtk_misc_irq_enable(eth);
+ 	schedule_delayed_work(&eth->reset.monitor_work,
+ 			      MTK_DMA_MONITOR_TIMEOUT);
+ 
+@@ -6114,6 +6188,11 @@
+ {
+ 	struct mtk_eth *eth = platform_get_drvdata(pdev);
+ 
++	if (eth->soc->has_misc_irq) {
++		disable_irq(eth->irq_misc);
++		mtk_misc_irq_disable(eth);
++	}
++
+ 	/* Unregistering the netdevs stops DMA while the hardware and PCS are
+ 	 * still available.
+ 	 */
+@@ -6352,6 +6431,7 @@
+ 	.hash_offset = 4,
+ 	.has_accounting = true,
+ 	.num_tx_queues = 32,
++	.has_misc_irq = true,
+ 	.foe_entry_size = MTK_FOE_ENTRY_V3_SIZE,
+ 	.tx = {
+ 		DESC_SIZE(struct mtk_tx_dma_v2),
