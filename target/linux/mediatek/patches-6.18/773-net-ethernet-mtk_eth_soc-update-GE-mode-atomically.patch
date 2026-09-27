@@ -1,0 +1,33 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Mon, 28 Sep 2026 20:09:00 +0900
+Subject: [PATCH] net: ethernet: mtk_eth_soc: update GE mode atomically
+
+ETHSYS_SYSCFG0 is shared by every MAC.  Updating a single MAC's GE_MODE
+field with a whole-register read followed by a write can restore stale
+SGMII selection bits changed concurrently by another phylink worker.
+
+Use regmap_update_bits() for the per-MAC GE_MODE field so the regmap lock
+serializes it with the existing SGMII path updates.
+
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -786,10 +786,9 @@ static void mtk_mac_config(struct phylin
+ 		}
+ 
+ 		/* put the gmac into the right mode */
+-		regmap_read(eth->ethsys, ETHSYS_SYSCFG0, &val);
+-		val &= ~SYSCFG0_GE_MODE(SYSCFG0_GE_MASK, mac->id);
+-		val |= SYSCFG0_GE_MODE(ge_mode, mac->id);
+-		regmap_write(eth->ethsys, ETHSYS_SYSCFG0, val);
++		regmap_update_bits(eth->ethsys, ETHSYS_SYSCFG0,
++				   SYSCFG0_GE_MODE(SYSCFG0_GE_MASK, mac->id),
++				   SYSCFG0_GE_MODE(ge_mode, mac->id));
+ 	}
+ 
+ 	/* SGMII */
