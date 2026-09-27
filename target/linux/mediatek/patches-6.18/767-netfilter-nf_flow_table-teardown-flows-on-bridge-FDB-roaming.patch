@@ -1,0 +1,394 @@
+From 79ba7f4667a0848dbdf4546a361f8f74cdf1e6da Mon Sep 17 00:00:00 2001
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Date: Wed, 24 Sep 2025 12:52:33 +0800
+Subject: [PATCH] netfilter: nf_flow_table: teardown flows on bridge FDB roaming
+
+Without this patch, traffic may stop for over 30 seconds when a station
+roams between bridge ports.
+
+The switchdev notifier approach comes from a downstream patch by Chad
+Monroe and MediaTek's version was authored by Bo-Cun Chen. This port omits
+the downstream per-flowtable direct-xmit counter, gates cleanup on actual
+matches, skips flows already being torn down, and handles carrier-loss FDB
+events.
+
+Linux 6.18 can retain FLOW_OFFLOAD_XMIT_NEIGH for the bridge-bound tuple
+while resolving its destination MAC when building the hardware rule.
+Resolve that neighbor during cleanup too. Otherwise, the FDB event cannot
+select the offloaded Wi-Fi flow.
+
+Serialize packet-path refresh, periodic GC, and hardware work around the
+forced teardown so a late REPLACE or STATS operation cannot block or undo
+the hardware delete. Store events in a fixed, deduplicating queue. If that
+queue overflows, tear down all flows. This conservative fallback avoids
+losing an FDB event or growing an unbounded work backlog.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/25.12/files/target/linux/mediatek/patches-6.12/999-ppe-08-mtk_ppe-add-roaming-handler.patch
+Link: https://github.com/cmonroe/target-mediatek/blob/c18b780f63a277dfc574d0ee61b5e60c94642ea7/cascade/patches-6.18/990-01-smartrg-netfilter-nf_flow_table-invalidate-flows-on-bridge-FDB-roaming.patch
+Assisted-by: Codex:gpt-5.6-sol
+Co-developed-by: Paul-Louis Charrière <plcharriere@gmail.com>
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ net/netfilter/nf_flow_table_core.c    | 296 +++++++++++++++++++++++++-
+ net/netfilter/nf_flow_table_offload.c |   3 +
+ 2 files changed, 298 insertions(+), 1 deletion(-)
+
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -5,17 +5,51 @@
+ #include <linux/netfilter.h>
+ #include <linux/rhashtable.h>
+ #include <linux/netdevice.h>
++#include <linux/etherdevice.h>
+ #include <net/ip.h>
+ #include <net/ip6_route.h>
++#include <net/neighbour.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++#include <net/switchdev.h>
++#endif
+ 
+ static DEFINE_MUTEX(flowtable_lock);
+ static LIST_HEAD(flowtables);
+ 
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++#define FLOW_MAC_CLEANUP_MAX_EVENTS	64
++
++static struct workqueue_struct *flow_mac_cleanup_wq;
++
++struct flow_mac_cleanup_event {
++	struct net		*net;
++	u8			mac[ETH_ALEN];
++};
++
++struct flow_mac_cleanup_batch {
++	struct flow_mac_cleanup_event *events;
++	unsigned int		count;
++	bool			all;
++	bool			found;
++};
++
++struct flow_mac_cleanup_state {
++	struct work_struct	work;
++	spinlock_t		lock; /* protects the fields below */
++	unsigned int		count;
++	bool			overflow;
++	bool			scheduled;
++	struct flow_mac_cleanup_event events[FLOW_MAC_CLEANUP_MAX_EVENTS];
++};
++
++static struct flow_mac_cleanup_state flow_mac_cleanup;
++#endif
++
+ static void
+ flow_offload_fill_dir(struct flow_offload *flow,
+ 		      enum flow_offload_tuple_dir dir)
+@@ -362,7 +396,8 @@ void flow_offload_refresh(struct nf_flow
+ 		return;
+ 
+ 	if (likely(!nf_flowtable_hw_offload(flow_table)) ||
+-	    test_bit(NF_FLOW_CLOSING, &flow->flags))
++	    test_bit(NF_FLOW_CLOSING, &flow->flags) ||
++	    test_bit(NF_FLOW_TEARDOWN, &flow->flags))
+ 		return;
+ 
+ 	nf_flow_offload_add(flow_table, flow);
+@@ -388,7 +423,241 @@ void flow_offload_teardown(struct flow_o
+ 		flow_offload_fixup_ct(flow);
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
++
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++static bool
++flow_offload_dst_mac(const struct flow_offload *flow,
++		     enum flow_offload_tuple_dir dir, u8 *ha)
++{
++	const struct flow_offload_tuple *other_tuple, *tuple;
++	const void *daddr;
++	struct neighbour *n;
++	u8 nud_state;
++
++	tuple = &flow->tuplehash[dir].tuple;
++	switch (tuple->xmit_type) {
++	case FLOW_OFFLOAD_XMIT_DIRECT:
++		ether_addr_copy(ha, tuple->out.h_dest);
++		return true;
++	case FLOW_OFFLOAD_XMIT_NEIGH:
++		if (!test_bit(NF_FLOW_HW, &flow->flags))
++			return false;
++
++		if (!tuple->dst_cache)
++			return false;
++
++		other_tuple = &flow->tuplehash[!dir].tuple;
++		daddr = &other_tuple->src_v4;
++		n = dst_neigh_lookup(tuple->dst_cache, daddr);
++		if (!n)
++			return false;
++
++		read_lock_bh(&n->lock);
++		nud_state = n->nud_state;
++		ether_addr_copy(ha, n->ha);
++		read_unlock_bh(&n->lock);
++		neigh_release(n);
++
++		return nud_state & NUD_VALID;
++	default:
++		return false;
++	}
++}
+ 
++static void nf_flow_table_do_cleanup_mac(struct nf_flowtable *flowtable,
++					 struct flow_offload *flow, void *data)
++{
++	const struct flow_offload_tuple *t = &flow->tuplehash[0].tuple;
++	struct flow_mac_cleanup_batch *batch = data;
++	struct net *net = nf_ct_net(flow->ct);
++	const u8 *matched_mac = NULL;
++	unsigned int i;
++	int dir;
++
++	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
++		return;
++
++	if (batch->all)
++		goto teardown;
++
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		u8 h_dest[ETH_ALEN];
++
++		if (!flow_offload_dst_mac(flow, dir, h_dest))
++			continue;
++
++		for (i = 0; i < batch->count; i++) {
++			if (!net_eq(net, batch->events[i].net) ||
++			    !ether_addr_equal(h_dest, batch->events[i].mac))
++				continue;
++
++			matched_mac = batch->events[i].mac;
++			goto teardown;
++		}
++	}
++
++	return;
++
++teardown:
++	if (matched_mac && t->l3proto == NFPROTO_IPV4)
++		pr_debug("nf_flow_table: teardown flow %pI4:%u->%pI4:%u proto=%u for roaming mac=%pM\n",
++			 &t->src_v4, ntohs(t->src_port),
++			 &t->dst_v4, ntohs(t->dst_port),
++			 t->l4proto, matched_mac);
++	else if (matched_mac)
++		pr_debug("nf_flow_table: teardown flow %pI6c:%u->%pI6c:%u proto=%u for roaming mac=%pM\n",
++			 &t->src_v6, ntohs(t->src_port),
++			 &t->dst_v6, ntohs(t->dst_port),
++			 t->l4proto, matched_mac);
++
++	flow_offload_teardown(flow);
++	batch->found = true;
++}
++
++static void nf_flow_table_cleanup_batch(struct flow_mac_cleanup_batch *batch)
++{
++	struct nf_flowtable *flowtable;
++
++	if (batch->all)
++		pr_debug("nf_flow_table: FDB cleanup queue overflow\n");
++
++	mutex_lock(&flowtable_lock);
++	list_for_each_entry(flowtable, &flowtables, list) {
++		batch->found = false;
++		nf_flow_table_iterate(flowtable,
++				      nf_flow_table_do_cleanup_mac, batch);
++		if (!batch->found)
++			continue;
++
++		/* Stop pre-teardown packet and GC producers, drain queued work,
++		 * explicitly queue the destroy, then wait for hardware completion.
++		 */
++		synchronize_net();
++		cancel_delayed_work_sync(&flowtable->gc_work);
++		nf_flow_table_offload_flush(flowtable);
++		nf_flow_table_gc_run(flowtable);
++		nf_flow_table_offload_flush(flowtable);
++		queue_delayed_work(system_power_efficient_wq,
++				   &flowtable->gc_work, HZ);
++	}
++	mutex_unlock(&flowtable_lock);
++}
++
++static bool flow_mac_cleanup_take_batch(struct flow_mac_cleanup_batch *batch)
++{
++	struct flow_mac_cleanup_state *state = &flow_mac_cleanup;
++	unsigned long flags;
++
++	spin_lock_irqsave(&state->lock, flags);
++	if (!state->count && !state->overflow) {
++		state->scheduled = false;
++		spin_unlock_irqrestore(&state->lock, flags);
++		return false;
++	}
++
++	batch->count = state->count;
++	batch->all = state->overflow;
++	memcpy(batch->events, state->events,
++	       sizeof(*batch->events) * state->count);
++	state->count = 0;
++	state->overflow = false;
++	spin_unlock_irqrestore(&state->lock, flags);
++
++	return true;
++}
++
++/* Tear down flows for a bounded batch of FDB events. Overflow conservatively
++ * tears down every flow so no event can be lost under sustained FDB churn.
++ */
++static void flow_mac_cleanup_work_handler(struct work_struct *work)
++{
++	struct flow_mac_cleanup_event events[FLOW_MAC_CLEANUP_MAX_EVENTS];
++	struct flow_mac_cleanup_batch batch = {
++		.events = events,
++	};
++	unsigned int i;
++
++	while (flow_mac_cleanup_take_batch(&batch)) {
++		nf_flow_table_cleanup_batch(&batch);
++
++		for (i = 0; i < batch.count; i++)
++			put_net(batch.events[i].net);
++	}
++}
++
++/* Queue teardown for flows going to @mac. The fixed queue is callable from
++ * atomic context and deduplicates repeated events without allocating memory.
++ */
++static void nf_flow_table_cleanup_mac(struct net *net, const u8 *mac)
++{
++	struct flow_mac_cleanup_state *state = &flow_mac_cleanup;
++	unsigned long flags;
++	bool queue = false;
++	unsigned int i;
++
++	spin_lock_irqsave(&state->lock, flags);
++	if (!state->overflow) {
++		for (i = 0; i < state->count; i++) {
++			if (net_eq(net, state->events[i].net) &&
++			    ether_addr_equal(mac, state->events[i].mac))
++				goto schedule;
++		}
++
++		if (state->count < FLOW_MAC_CLEANUP_MAX_EVENTS) {
++			state->events[state->count].net = get_net(net);
++			ether_addr_copy(state->events[state->count].mac, mac);
++			state->count++;
++		} else {
++			state->overflow = true;
++		}
++	}
++
++schedule:
++	if (!state->scheduled) {
++		state->scheduled = true;
++		queue = true;
++	}
++	spin_unlock_irqrestore(&state->lock, flags);
++
++	if (queue)
++		WARN_ON_ONCE(!queue_work(flow_mac_cleanup_wq, &state->work));
++}
++
++/* br_fdb_update() emits SWITCHDEV_FDB_DEL_TO_DEVICE with the stale port before
++ * it repoints fdb->dst, so this fires on every bridge FDB roam.
++ */
++static int nf_flow_table_switchdev_event(struct notifier_block *nb,
++					 unsigned long event, void *ptr)
++{
++	struct switchdev_notifier_fdb_info *fdb_info = ptr;
++	struct net_device *dev;
++
++	if (event != SWITCHDEV_FDB_DEL_TO_DEVICE)
++		return NOTIFY_DONE;
++
++	if (!fdb_info || !fdb_info->addr || !fdb_info->info.dev)
++		return NOTIFY_DONE;
++
++	if (fdb_info->is_local || is_multicast_ether_addr(fdb_info->addr))
++		return NOTIFY_DONE;
++
++	dev = fdb_info->info.dev;
++	if (netif_is_bridge_master(dev))
++		return NOTIFY_DONE;
++
++	pr_debug("nf_flow_table: FDB roaming detected del mac=%pM from port=%s\n",
++		 fdb_info->addr, dev->name);
++
++	nf_flow_table_cleanup_mac(dev_net(dev), fdb_info->addr);
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block flow_offload_switchdev_notifier = {
++	.notifier_call = nf_flow_table_switchdev_event,
++};
++#endif
++
+ struct flow_offload_tuple_rhash *
+ flow_offload_lookup(struct nf_flowtable *flow_table,
+ 		    struct flow_offload_tuple *tuple)
+@@ -848,8 +1117,28 @@ static int __init nf_flow_table_module_i
+ 	if (ret)
+ 		goto out_bpf;
+ 
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++	flow_mac_cleanup_wq = alloc_ordered_workqueue("nf_ft_mac_cleanup", 0);
++	if (!flow_mac_cleanup_wq) {
++		ret = -ENOMEM;
++		goto out_wq;
++	}
++	spin_lock_init(&flow_mac_cleanup.lock);
++	INIT_WORK(&flow_mac_cleanup.work, flow_mac_cleanup_work_handler);
++
++	ret = register_switchdev_notifier(&flow_offload_switchdev_notifier);
++	if (ret)
++		goto out_switchdev;
++#endif
++
+ 	return 0;
+ 
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++out_switchdev:
++	destroy_workqueue(flow_mac_cleanup_wq);
++out_wq:
++	unregister_netdevice_notifier(&flow_offload_netdev_notifier);
++#endif
+ out_bpf:
+ 	nf_flow_table_offload_exit();
+ out_offload:
+@@ -859,6 +1148,11 @@ out_offload:
+ 
+ static void __exit nf_flow_table_module_exit(void)
+ {
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++	unregister_switchdev_notifier(&flow_offload_switchdev_notifier);
++	/* flushes any cleanup work still queued */
++	destroy_workqueue(flow_mac_cleanup_wq);
++#endif
+ 	unregister_netdevice_notifier(&flow_offload_netdev_notifier);
+ 	nf_flow_table_offload_exit();
+ 	unregister_pernet_subsys(&nf_flow_table_net_ops);
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -973,6 +973,9 @@ static void flow_offload_work_add(struct
+ 	struct nf_flow_rule *flow_rule[FLOW_OFFLOAD_DIR_MAX];
+ 	int err;
+ 
++	if (test_bit(NF_FLOW_TEARDOWN, &offload->flow->flags))
++		return;
++
+ 	err = nf_flow_offload_alloc(offload, flow_rule);
+ 	if (err < 0)
+ 		return;

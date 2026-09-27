@@ -1,0 +1,569 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Mon, 28 Sep 2026 20:07:00 +0900
+Subject: [PATCH] netfilter: limit bridge FDB cleanup to actual moves
+
+A SWITCHDEV_FDB_DEL_TO_DEVICE notification does not identify roaming:
+bridge ageing, flush and port removal emit the same event. Listen for FDB
+additions instead and compare the current bridge FDB with the bridge egress
+port cached when each hardware flow was constructed. Tear a flow down only
+when its destination MAC is now learned on a different bridge port.
+
+Coalesce any number of FDB additions into one current-state rescan. This
+uses bounded memory, cannot lose a move to atomic allocation failure and
+avoids doing one full flowtable walk per learning event. Ignore software
+flows and bridge FDB deletions.
+
+Neighbour-output routes name the bridge master rather than the selected
+bridge port. Add an RCU-safe bridge helper which returns the port only when
+all non-local FDB entries for the MAC agree, and cache that port and bridge
+ifindex together with the destination MAC while constructing the rule. This
+also lets the rescan identify a stale rule after the old Wi-Fi netdev or
+its neighbour entry has disappeared. Ambiguous and absent FDB state is
+ignored.
+
+Keep the existing workqueue drain that prevents a late hardware REPLACE
+from undoing cleanup.
+
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index 3daa3f6b9b40461b2e4e4874c83f847ab4d749e7..cc031e15e8387f65735709fd1d5f49db21649163 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -177,6 +177,8 @@ static inline int br_mst_get_state(const struct net_device *dev, u16 msti,
+ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ 				    const unsigned char *addr,
+ 				    __u16 vid);
++int br_fdb_find_port_ifindex(const struct net_device *br_dev,
++			     const unsigned char *addr);
+ void br_fdb_clear_offload(const struct net_device *dev, u16 vid);
+ bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag);
+ u8 br_port_get_stp_state(const struct net_device *dev);
+@@ -190,6 +192,13 @@ br_fdb_find_port(const struct net_device *br_dev,
+ 	return NULL;
+ }
+ 
++static inline int
++br_fdb_find_port_ifindex(const struct net_device *br_dev,
++			 const unsigned char *addr)
++{
++	return 0;
++}
++
+ static inline void br_fdb_clear_offload(const struct net_device *dev, u16 vid)
+ {
+ }
+diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+index 33b7b93333c1c1de8247e4ddbd9a5fbae5996d73..0f04ca67b224612dbf24fe81626f5c46124fcb59 100644
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -154,6 +154,11 @@ struct flow_offload_tuple {
+ 			u32		iifidx;
+ 		} tc;
+ 	};
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++	atomic64_t			hw_h_dest;
++	u32				hw_fdb_ifidx;
++	u32				hw_br_ifidx;
++#endif
+ };
+ 
+ struct flow_offload_tuple_rhash {
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 6eb3ab69a5140f719ec62ed388ee43fdfac0e79c..466736860c875c596ef1260bafc4ac9861eaad21 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -260,6 +260,48 @@ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ }
+ EXPORT_SYMBOL_GPL(br_fdb_find_port);
+ 
++/* Return the bridge port used by every non-local entry for @addr.  Returning
++ * an ifindex instead of a device pointer makes this helper safe without RTNL;
++ * zero means that the address is absent or resolves to more than one port.
++ */
++int br_fdb_find_port_ifindex(const struct net_device *br_dev,
++			     const unsigned char *addr)
++{
++	const struct net_bridge_port *dst;
++	struct net_bridge_fdb_entry *f;
++	struct net_bridge *br;
++	int ifindex = 0;
++
++	if (!netif_is_bridge_master(br_dev))
++		return 0;
++
++	br = netdev_priv(br_dev);
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(f, &br->fdb_list, fdb_node) {
++		if (!ether_addr_equal(f->key.addr.addr, addr) ||
++		    test_bit(BR_FDB_LOCAL, &f->flags))
++			continue;
++
++		dst = READ_ONCE(f->dst);
++		if (!dst)
++			continue;
++
++		if (!ifindex) {
++			ifindex = dst->dev->ifindex;
++			continue;
++		}
++
++		if (ifindex != dst->dev->ifindex) {
++			ifindex = 0;
++			break;
++		}
++	}
++	rcu_read_unlock();
++
++	return ifindex;
++}
++EXPORT_SYMBOL_GPL(br_fdb_find_port_ifindex);
++
+ struct net_bridge_fdb_entry *br_fdb_find_rcu(struct net_bridge *br,
+ 					     const unsigned char *addr,
+ 					     __u16 vid)
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index 5894815f50d8bd7928df311e552173d385bb5cff..8e40e6684ea88395160d7efd5a7e70ddac362ca1 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -15,6 +15,7 @@
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
+ #if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++#include <linux/if_bridge.h>
+ #include <net/switchdev.h>
+ #endif
+ 
+@@ -22,29 +23,13 @@ static DEFINE_MUTEX(flowtable_lock);
+ static LIST_HEAD(flowtables);
+ 
+ #if IS_ENABLED(CONFIG_NET_SWITCHDEV)
+-#define FLOW_MAC_CLEANUP_MAX_EVENTS	64
+-
+ static struct workqueue_struct *flow_mac_cleanup_wq;
+ 
+-struct flow_mac_cleanup_event {
+-	struct net		*net;
+-	u8			mac[ETH_ALEN];
+-};
+-
+-struct flow_mac_cleanup_batch {
+-	struct flow_mac_cleanup_event *events;
+-	unsigned int		count;
+-	bool			all;
+-	bool			found;
+-};
+-
+ struct flow_mac_cleanup_state {
+ 	struct work_struct	work;
+ 	spinlock_t		lock; /* protects the fields below */
+-	unsigned int		count;
+-	bool			overflow;
++	bool			dirty;
+ 	bool			scheduled;
+-	struct flow_mac_cleanup_event events[FLOW_MAC_CLEANUP_MAX_EVENTS];
+ };
+ 
+ static struct flow_mac_cleanup_state flow_mac_cleanup;
+@@ -426,27 +411,41 @@ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 
+ #if IS_ENABLED(CONFIG_NET_SWITCHDEV)
+ static bool
+-flow_offload_dst_mac(const struct flow_offload *flow,
+-		     enum flow_offload_tuple_dir dir, u8 *ha)
++flow_offload_dst(const struct flow_offload *flow,
++		 enum flow_offload_tuple_dir dir, u8 *ha,
++		 u32 *fdb_ifindex, u32 *br_ifindex)
+ {
+ 	const struct flow_offload_tuple *other_tuple, *tuple;
+ 	const void *daddr;
+ 	struct neighbour *n;
++	u64 hw_h_dest;
+ 	u8 nud_state;
+ 
++	if (!test_bit(NF_FLOW_HW, &flow->flags))
++		return false;
++
+ 	tuple = &flow->tuplehash[dir].tuple;
++	*fdb_ifindex = READ_ONCE(tuple->hw_fdb_ifidx);
++	*br_ifindex = READ_ONCE(tuple->hw_br_ifidx);
++	if (!*fdb_ifindex || !*br_ifindex)
++		return false;
++
+ 	switch (tuple->xmit_type) {
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+ 		ether_addr_copy(ha, tuple->out.h_dest);
+ 		return true;
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+-		if (!test_bit(NF_FLOW_HW, &flow->flags))
+-			return false;
++		other_tuple = &flow->tuplehash[!dir].tuple;
++
++		hw_h_dest = atomic64_read(&tuple->hw_h_dest);
++		if (hw_h_dest) {
++			u64_to_ether_addr(hw_h_dest, ha);
++			return true;
++		}
+ 
+ 		if (!tuple->dst_cache)
+ 			return false;
+ 
+-		other_tuple = &flow->tuplehash[!dir].tuple;
+ 		daddr = &other_tuple->src_v4;
+ 		n = dst_neigh_lookup(tuple->dst_cache, daddr);
+ 		if (!n)
+@@ -464,155 +463,120 @@ flow_offload_dst_mac(const struct flow_offload *flow,
+ 	}
+ }
+ 
+-static void nf_flow_table_do_cleanup_mac(struct nf_flowtable *flowtable,
+-					 struct flow_offload *flow, void *data)
++static bool flow_offload_fdb_moved(const struct flow_offload *flow,
++				   enum flow_offload_tuple_dir dir, u8 *ha)
+ {
+-	const struct flow_offload_tuple *t = &flow->tuplehash[0].tuple;
+-	struct flow_mac_cleanup_batch *batch = data;
++	struct net_device *br_dev;
+ 	struct net *net = nf_ct_net(flow->ct);
+-	const u8 *matched_mac = NULL;
+-	unsigned int i;
+-	int dir;
++	u32 fdb_ifindex, br_ifindex;
++	int current_ifindex;
+ 
+-	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
+-		return;
++	if (!flow_offload_dst(flow, dir, ha, &fdb_ifindex, &br_ifindex))
++		return false;
+ 
+-	if (batch->all)
+-		goto teardown;
++	br_dev = dev_get_by_index(net, br_ifindex);
++	if (!br_dev)
++		return false;
+ 
+-	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
+-		u8 h_dest[ETH_ALEN];
++	current_ifindex = br_fdb_find_port_ifindex(br_dev, ha);
++	dev_put(br_dev);
+ 
+-		if (!flow_offload_dst_mac(flow, dir, h_dest))
+-			continue;
++	return current_ifindex && current_ifindex != fdb_ifindex;
++}
+ 
+-		for (i = 0; i < batch->count; i++) {
+-			if (!net_eq(net, batch->events[i].net) ||
+-			    !ether_addr_equal(h_dest, batch->events[i].mac))
+-				continue;
++static void nf_flow_table_do_cleanup_fdb(struct nf_flowtable *flowtable,
++					 struct flow_offload *flow, void *data)
++{
++	const struct flow_offload_tuple *t = &flow->tuplehash[0].tuple;
++	bool *found = data;
++	u8 h_dest[ETH_ALEN];
++	int dir;
++
++	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags) ||
++	    !test_bit(NF_FLOW_HW, &flow->flags))
++		return;
+ 
+-			matched_mac = batch->events[i].mac;
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++)
++		if (flow_offload_fdb_moved(flow, dir, h_dest))
+ 			goto teardown;
+-		}
+-	}
+ 
+ 	return;
+ 
+ teardown:
+-	if (matched_mac && t->l3proto == NFPROTO_IPV4)
++	if (t->l3proto == NFPROTO_IPV4)
+ 		pr_debug("nf_flow_table: teardown flow %pI4:%u->%pI4:%u proto=%u for roaming mac=%pM\n",
+ 			 &t->src_v4, ntohs(t->src_port),
+ 			 &t->dst_v4, ntohs(t->dst_port),
+-			 t->l4proto, matched_mac);
+-	else if (matched_mac)
++			 t->l4proto, h_dest);
++	else
+ 		pr_debug("nf_flow_table: teardown flow %pI6c:%u->%pI6c:%u proto=%u for roaming mac=%pM\n",
+ 			 &t->src_v6, ntohs(t->src_port),
+ 			 &t->dst_v6, ntohs(t->dst_port),
+-			 t->l4proto, matched_mac);
++			 t->l4proto, h_dest);
+ 
+ 	flow_offload_teardown(flow);
+-	batch->found = true;
+-}
+-
+-static void nf_flow_table_cleanup_batch(struct flow_mac_cleanup_batch *batch)
+-{
+-	struct nf_flowtable *flowtable;
+-
+-	if (batch->all)
+-		pr_debug("nf_flow_table: FDB cleanup queue overflow\n");
+-
+-	mutex_lock(&flowtable_lock);
+-	list_for_each_entry(flowtable, &flowtables, list) {
+-		batch->found = false;
+-		nf_flow_table_iterate(flowtable,
+-				      nf_flow_table_do_cleanup_mac, batch);
+-		if (!batch->found)
+-			continue;
+-
+-		/* Stop pre-teardown packet and GC producers, drain queued work,
+-		 * explicitly queue the destroy, then wait for hardware completion.
+-		 */
+-		synchronize_net();
+-		cancel_delayed_work_sync(&flowtable->gc_work);
+-		nf_flow_table_offload_flush(flowtable);
+-		nf_flow_table_gc_run(flowtable);
+-		nf_flow_table_offload_flush(flowtable);
+-		queue_delayed_work(system_power_efficient_wq,
+-				   &flowtable->gc_work, HZ);
+-	}
+-	mutex_unlock(&flowtable_lock);
++	*found = true;
+ }
+ 
+-static bool flow_mac_cleanup_take_batch(struct flow_mac_cleanup_batch *batch)
++static bool flow_mac_cleanup_take_dirty(void)
+ {
+ 	struct flow_mac_cleanup_state *state = &flow_mac_cleanup;
+ 	unsigned long flags;
++	bool dirty;
+ 
+ 	spin_lock_irqsave(&state->lock, flags);
+-	if (!state->count && !state->overflow) {
++	dirty = state->dirty;
++	state->dirty = false;
++	if (!dirty)
+ 		state->scheduled = false;
+-		spin_unlock_irqrestore(&state->lock, flags);
+-		return false;
+-	}
+-
+-	batch->count = state->count;
+-	batch->all = state->overflow;
+-	memcpy(batch->events, state->events,
+-	       sizeof(*batch->events) * state->count);
+-	state->count = 0;
+-	state->overflow = false;
+ 	spin_unlock_irqrestore(&state->lock, flags);
+ 
+-	return true;
++	return dirty;
+ }
+ 
+-/* Tear down flows for a bounded batch of FDB events. Overflow conservatively
+- * tears down every flow so no event can be lost under sustained FDB churn.
++/* Coalesce any number of additions into a current-FDB rescan. This stays
++ * bounded under learning churn and cannot lose a move to allocation failure.
+  */
+ static void flow_mac_cleanup_work_handler(struct work_struct *work)
+ {
+-	struct flow_mac_cleanup_event events[FLOW_MAC_CLEANUP_MAX_EVENTS];
+-	struct flow_mac_cleanup_batch batch = {
+-		.events = events,
+-	};
+-	unsigned int i;
++	struct nf_flowtable *flowtable;
+ 
+-	while (flow_mac_cleanup_take_batch(&batch)) {
+-		nf_flow_table_cleanup_batch(&batch);
++	while (flow_mac_cleanup_take_dirty()) {
++		mutex_lock(&flowtable_lock);
++		list_for_each_entry(flowtable, &flowtables, list) {
++			bool found = false;
+ 
+-		for (i = 0; i < batch.count; i++)
+-			put_net(batch.events[i].net);
++			nf_flow_table_iterate(flowtable,
++					      nf_flow_table_do_cleanup_fdb,
++					      &found);
++			if (!found)
++				continue;
++
++			/* Stop pre-teardown packet and GC producers, drain queued
++			 * work, explicitly queue destroy, then wait for hardware.
++			 */
++			synchronize_net();
++			cancel_delayed_work_sync(&flowtable->gc_work);
++			nf_flow_table_offload_flush(flowtable);
++			nf_flow_table_gc_run(flowtable);
++			nf_flow_table_offload_flush(flowtable);
++			queue_delayed_work(system_power_efficient_wq,
++					   &flowtable->gc_work, HZ);
++		}
++		mutex_unlock(&flowtable_lock);
++		cond_resched();
+ 	}
+ }
+ 
+-/* Queue teardown for flows going to @mac. The fixed queue is callable from
+- * atomic context and deduplicates repeated events without allocating memory.
+- */
+-static void nf_flow_table_cleanup_mac(struct net *net, const u8 *mac)
++/* Mark the FDB state dirty from the atomic switchdev notifier. */
++static void nf_flow_table_queue_fdb_check(void)
+ {
+ 	struct flow_mac_cleanup_state *state = &flow_mac_cleanup;
+ 	unsigned long flags;
+ 	bool queue = false;
+-	unsigned int i;
+ 
+ 	spin_lock_irqsave(&state->lock, flags);
+-	if (!state->overflow) {
+-		for (i = 0; i < state->count; i++) {
+-			if (net_eq(net, state->events[i].net) &&
+-			    ether_addr_equal(mac, state->events[i].mac))
+-				goto schedule;
+-		}
+-
+-		if (state->count < FLOW_MAC_CLEANUP_MAX_EVENTS) {
+-			state->events[state->count].net = get_net(net);
+-			ether_addr_copy(state->events[state->count].mac, mac);
+-			state->count++;
+-		} else {
+-			state->overflow = true;
+-		}
+-	}
+-
+-schedule:
++	state->dirty = true;
+ 	if (!state->scheduled) {
+ 		state->scheduled = true;
+ 		queue = true;
+@@ -623,8 +587,8 @@ schedule:
+ 		WARN_ON_ONCE(!queue_work(flow_mac_cleanup_wq, &state->work));
+ }
+ 
+-/* br_fdb_update() emits SWITCHDEV_FDB_DEL_TO_DEVICE with the stale port before
+- * it repoints fdb->dst, so this fires on every bridge FDB roam.
++/* A new FDB entry may have moved a hardware-flow destination to another
++ * bridge port. DEL events alone are ageing or flushes and do not trigger it.
+  */
+ static int nf_flow_table_switchdev_event(struct notifier_block *nb,
+ 					 unsigned long event, void *ptr)
+@@ -632,7 +596,7 @@ static int nf_flow_table_switchdev_event(struct notifier_block *nb,
+ 	struct switchdev_notifier_fdb_info *fdb_info = ptr;
+ 	struct net_device *dev;
+ 
+-	if (event != SWITCHDEV_FDB_DEL_TO_DEVICE)
++	if (event != SWITCHDEV_FDB_ADD_TO_DEVICE)
+ 		return NOTIFY_DONE;
+ 
+ 	if (!fdb_info || !fdb_info->addr || !fdb_info->info.dev)
+@@ -645,10 +609,10 @@ static int nf_flow_table_switchdev_event(struct notifier_block *nb,
+ 	if (netif_is_bridge_master(dev))
+ 		return NOTIFY_DONE;
+ 
+-	pr_debug("nf_flow_table: FDB roaming detected del mac=%pM from port=%s\n",
++	pr_debug("nf_flow_table: FDB destination learned mac=%pM on port=%s\n",
+ 		 fdb_info->addr, dev->name);
+ 
+-	nf_flow_table_cleanup_mac(dev_net(dev), fdb_info->addr);
++	nf_flow_table_queue_fdb_check();
+ 
+ 	return NOTIFY_DONE;
+ }
+diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+index f3b706891c0afc20ca765f97479c0107c2af2d65..504cae2d62975fac505653fed10fb0234c402434 100644
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -5,6 +5,9 @@
+ #include <linux/rhashtable.h>
+ #include <linux/netdevice.h>
+ #include <linux/tc_act/tc_csum.h>
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++#include <linux/if_bridge.h>
++#endif
+ #include <net/flow_offload.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_tables.h>
+@@ -277,14 +280,59 @@ static int flow_offload_eth_src(struct net *net,
+ 	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++static void flow_offload_cache_fdb_path(struct net *net,
++					struct flow_offload_tuple *tuple,
++					const unsigned char *ha)
++{
++	struct net_device *dev, *br_dev = NULL;
++	int fdb_ifindex = 0;
++
++	WRITE_ONCE(tuple->hw_fdb_ifidx, 0);
++	WRITE_ONCE(tuple->hw_br_ifidx, 0);
++
++	switch (tuple->xmit_type) {
++	case FLOW_OFFLOAD_XMIT_DIRECT:
++		dev = dev_get_by_index(net, tuple->out.hw_ifidx);
++		if (!dev)
++			return;
++
++		rcu_read_lock();
++		br_dev = netdev_master_upper_dev_get_rcu(dev);
++		if (br_dev && netif_is_bridge_master(br_dev)) {
++			WRITE_ONCE(tuple->hw_fdb_ifidx, dev->ifindex);
++			WRITE_ONCE(tuple->hw_br_ifidx, br_dev->ifindex);
++		}
++		rcu_read_unlock();
++		dev_put(dev);
++		break;
++	case FLOW_OFFLOAD_XMIT_NEIGH:
++		dev = tuple->dst_cache->dev;
++		if (!netif_is_bridge_master(dev))
++			return;
++
++		fdb_ifindex = br_fdb_find_port_ifindex(dev, ha);
++		if (!fdb_ifindex)
++			return;
++
++		WRITE_ONCE(tuple->hw_fdb_ifidx, fdb_ifindex);
++		WRITE_ONCE(tuple->hw_br_ifidx, dev->ifindex);
++		break;
++	default:
++		break;
++	}
++}
++#endif
++
+ static int flow_offload_eth_dst(struct net *net,
+-				const struct flow_offload *flow,
++				struct flow_offload *flow,
+ 				enum flow_offload_tuple_dir dir,
+ 				struct nf_flow_rule *flow_rule)
+ {
+ 	struct flow_action_entry *entry0 = flow_action_entry_next(flow_rule);
+ 	struct flow_action_entry *entry1 = flow_action_entry_next(flow_rule);
+-	const struct flow_offload_tuple *other_tuple, *this_tuple;
++	const struct flow_offload_tuple *other_tuple;
++	struct flow_offload_tuple *this_tuple;
+ 	const struct dst_entry *dst_cache;
+ 	unsigned char ha[ETH_ALEN];
+ 	struct neighbour *n;
+@@ -323,6 +371,12 @@ static int flow_offload_eth_dst(struct net *net,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++	if (this_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
++		atomic64_set(&this_tuple->hw_h_dest, ether_addr_to_u64(ha));
++	flow_offload_cache_fdb_path(net, this_tuple, ha);
++#endif
++
+ 	mask = ~0xffffffff;
+ 	memcpy(&val, ha, 4);
+ 	flow_offload_mangle(entry0, FLOW_ACT_MANGLE_HDR_TYPE_ETH, 0,
+@@ -678,7 +732,7 @@ static int flow_offload_decap_tunnel(const struct flow_offload *flow,
+ }
+ 
+ static int
+-nf_flow_rule_route_common(struct net *net, const struct flow_offload *flow,
++nf_flow_rule_route_common(struct net *net, struct flow_offload *flow,
+ 			  enum flow_offload_tuple_dir dir,
+ 			  struct nf_flow_rule *flow_rule)
+ {
