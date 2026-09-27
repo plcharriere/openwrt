@@ -1,0 +1,34 @@
+From d933c660a042bd291511cba53b9cfb444d49fbaa Mon Sep 17 00:00:00 2001
+From: "chak-kei.lam" <chak-kei.lam@mediatek.com>
+Date: Tue, 20 Jan 2026 16:35:52 +0800
+Subject: [PATCH] net: ethernet: mtk_eth_soc: release PPE tables on remove
+
+The controller-wide PPE flow table and each PPE's L2 flow table remain
+allocated when the Ethernet platform driver is removed.
+
+Patch 758 already initializes the shared flow table once and keeps the
+probe-error cleanup separate from per-PPE cleanup. Preserve that ordering
+on the successful remove path: unregister the netdevs first, then destroy
+the shared flow table and the per-PPE tables exactly once.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/25.12/files/target/linux/mediatek/patches-6.12/999-ppe-33-net-ethernet-mtk_eth_soc-fix-mtk_eth_offload_init-memory-leak.patch
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -6062,6 +6062,11 @@ static void mtk_remove(struct platform_d
+ 
+ 	mtk_napi_del(eth);
+ 	mtk_cleanup(eth);
++	if (eth->soc->offload_version) {
++		rhashtable_destroy(&eth->flow_table);
++		mtk_ppe_deinit(eth);
++	}
++
+ 	free_netdev(eth->dummy_dev);
+ 	mtk_mdio_cleanup(eth);
+ }
