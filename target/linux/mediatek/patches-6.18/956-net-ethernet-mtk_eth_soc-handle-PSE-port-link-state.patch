@@ -1,0 +1,122 @@
+From 9453a58b1495ae7133181615dfad1a4f9581925a Mon Sep 17 00:00:00 2001
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Date: Fri, 8 May 2026 11:20:00 +0800
+Subject: [PATCH] net: ethernet: mtk_eth_soc: handle PSE port link state
+
+Prevent the PSE from forwarding traffic to a MAC port while it is being
+stopped.  Wait for the GDM and MAC paths to become idle, mark the PSE
+output port down, and only then disable the MAC.  Re-enable the PSE output
+after the MAC has been configured on link-up.
+
+Without this sequence, traffic can remain stuck in a PSE output queue when
+a PHY link drops under load.
+
+Restrict the behavior to MTK_XGMAC_V2, which currently identifies MT7987 in
+this driver.  The OpenWrt tree has not adopted MediaTek's PSE-port-indexed
+MTK_FE_GLO_CFG() refactor, so retain the existing MAC-indexed register-bank
+selection.  Use the serialized FE read/modify/write helper to preserve
+other PSE-port state in the shared register.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/25.12/files/target/linux/mediatek/patches-6.12/999-eth-48-mtk_eth_soc-add-PSE-port-link-handling-for-MAC-ports.patch
+Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Assisted-by: Codex:gpt-5.6-sol
+Co-developed-by: Paul-Louis Charrière <plcharriere@gmail.com>
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 62 +++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -562,6 +562,59 @@ static bool mtk_check_gmac23_idle(struct
+ 	return false;
+ }
+ 
++static const u32 mtk_mac_gdm_fsm[MTK_GMAC_ID_MAX] = {
++	[MTK_GMAC1_ID] = MTK_FE_GDM1_FSM,
++	[MTK_GMAC2_ID] = MTK_FE_CDM2_FSM,
++	[MTK_GMAC3_ID] = MTK_FE_CDM3_FSM,
++};
++
++static const u8 mtk_mac_pse_port[MTK_GMAC_ID_MAX] = {
++	[MTK_GMAC1_ID] = PSE_GDM1_PORT,
++	[MTK_GMAC2_ID] = PSE_GDM2_PORT,
++	[MTK_GMAC3_ID] = PSE_GDM3_PORT,
++};
++
++static void mtk_pse_gdm_enable(struct mtk_mac *mac, bool enable)
++{
++	u32 port = mtk_mac_pse_port[mac->id];
++	u32 mask = MTK_FE_LINK_DOWN_P(port);
++
++	mtk_fe_m32(mac->hw, mask, enable ? 0 : mask,
++		   MTK_FE_GLO_CFG(mac->id));
++}
++
++static int mtk_poll_mac123_idle(struct mtk_mac *mac)
++{
++	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
++	struct mtk_eth *eth = mac->hw;
++	u32 gdm_fsm, gdm_idle;
++	u32 mac_fsm, mac_idle;
++
++	do {
++		gdm_fsm = mtk_r32(eth, mtk_mac_gdm_fsm[mac->id]);
++		mac_fsm = mtk_r32(eth, MTK_MAC_FSM(mac->id));
++
++		if (mtk_interface_mode_is_xgmii(eth, mac->interface)) {
++			gdm_idle = ((gdm_fsm & 0x00ffffff) == 0);
++			mac_idle = 1;
++		} else {
++			gdm_idle = (gdm_fsm == 0);
++			mac_idle = (mac_fsm == 0x01010000 ||
++				    mac_fsm == 0x01010100);
++		}
++
++		if (gdm_idle && mac_idle)
++			return 0;
++
++		usleep_range(10000, 20000);
++	} while (time_before(jiffies, timeout));
++
++	dev_warn(eth->dev,
++		 "timeout waiting for GDM and MAC to become idle: GDM_FSM=0x%08x, MAC_FSM=0x%08x\n",
++		 gdm_fsm, mac_fsm);
++	return -ETIMEDOUT;
++}
++
+ static int mtk_mac_prepare(struct phylink_config *config, unsigned int mode,
+ 			   phy_interface_t iface)
+ {
+@@ -811,6 +864,11 @@ static void mtk_mac_link_down(struct phy
+ 					   phylink_config);
+ 	struct mtk_eth *eth = mac->hw;
+ 
++	if (MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2)) {
++		mtk_poll_mac123_idle(mac);
++		mtk_pse_gdm_enable(mac, false);
++	}
++
+ 	if (!mtk_interface_mode_is_xgmii(mac->hw, interface)) {
+ 		/* GMAC modes */
+ 		mtk_m32(mac->hw,
+@@ -1025,13 +1083,17 @@ static void mtk_mac_link_up(struct phyli
+ {
+ 	struct mtk_mac *mac = container_of(config, struct mtk_mac,
+ 					   phylink_config);
++	struct mtk_eth *eth = mac->hw;
+ 
+ 	if (mtk_interface_mode_is_xgmii(mac->hw, interface))
+ 		mtk_xgdm_mac_link_up(mac, phy, mode, interface, speed, duplex,
+ 				     tx_pause, rx_pause);
+ 	else
+ 		mtk_gdm_mac_link_up(mac, phy, mode, interface, speed, duplex,
+ 				    tx_pause, rx_pause);
++
++	if (MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2))
++		mtk_pse_gdm_enable(mac, true);
+ }
+ 
+ static void mtk_mac_disable_tx_lpi(struct phylink_config *config)
+-- 
+2.51.0

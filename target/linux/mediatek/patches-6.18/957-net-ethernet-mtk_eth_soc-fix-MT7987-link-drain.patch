@@ -1,0 +1,81 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Mon, 28 Sep 2026 20:16:00 +0900
+Subject: [PATCH] net: ethernet: mtk_eth_soc: fix MT7987 link drain
+
+The MT7987 link-down sequence must poll the GDM state machine belonging
+to the MAC.  The downstream 6.12 macro maps GMAC2 and GMAC3 to CDM2 and
+CDM3 instead, contradicting both the register names and MediaTek's older
+MT7987 SDK.  Use GDM2 and GDM3 as the driver's other DMA-hang checks do.
+
+Do not wait for the MAC to drain while NETSYS recovery is already forcing
+the data path down.  Hardware initialization also clears the PSE port
+gates, so close every MT7987 MAC port after cold enumeration and after
+recovery, then let phylink reopen ports whose link comes back up.
+
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 24 +++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -590,8 +590,8 @@ static bool mtk_check_gmac23_idle(struct
+ 
+ static const u32 mtk_mac_gdm_fsm[MTK_GMAC_ID_MAX] = {
+ 	[MTK_GMAC1_ID] = MTK_FE_GDM1_FSM,
+-	[MTK_GMAC2_ID] = MTK_FE_CDM2_FSM,
+-	[MTK_GMAC3_ID] = MTK_FE_CDM3_FSM,
++	[MTK_GMAC2_ID] = MTK_FE_GDM2_FSM,
++	[MTK_GMAC3_ID] = MTK_FE_GDM3_FSM,
+ };
+ 
+ static const u8 mtk_mac_pse_port[MTK_GMAC_ID_MAX] = {
+@@ -610,6 +610,18 @@ static void mtk_pse_gdm_enable(struct mtk_mac *mac, bool enable)
+ 	mtk_fe_m32(mac->hw, mask, enable ? 0 : mask,
+ 		   MTK_FE_GLO_CFG(mac->id));
+ }
++
++static void mtk_pse_gdm_disable_all(struct mtk_eth *eth)
++{
++	int i;
++
++	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2))
++		return;
++
++	for (i = 0; i < MTK_MAX_DEVS; i++)
++		if (eth->mac[i])
++			mtk_pse_gdm_enable(eth->mac[i], false);
++}
+ 
+ static int mtk_poll_mac123_idle(struct mtk_mac *mac)
+ {
+@@ -891,7 +891,8 @@ static void mtk_mac_link_down(struct phy
+ 	struct mtk_eth *eth = mac->hw;
+ 
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2)) {
+-		mtk_poll_mac123_idle(mac);
++		if (!test_bit(MTK_RESETTING, &eth->state))
++			mtk_poll_mac123_idle(mac);
+ 		mtk_pse_gdm_enable(mac, false);
+ 	}
+ 
+@@ -5239,6 +5251,8 @@ static void mtk_pending_work(struct work
+ 		pinctrl_select_state(eth->dev->pins->p,
+ 				     eth->dev->pins->default_state);
+ 	mtk_hw_init(eth, true);
++
++	mtk_pse_gdm_disable_all(eth);
+ 
+ 	/* restart DMA and enable IRQs */
+ 	for (i = 0; i < MTK_MAX_DEVS; i++) {
+@@ -6260,6 +6274,9 @@ static int mtk_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	/* Hardware initialization leaves every PSE MAC-port gate open. */
++	mtk_pse_gdm_disable_all(eth);
++
+ 	/* check if all MAC address providers are available and return
+ 	 * -EPROBE_DEFER in case at least one of them is not ready
+ 	 */
