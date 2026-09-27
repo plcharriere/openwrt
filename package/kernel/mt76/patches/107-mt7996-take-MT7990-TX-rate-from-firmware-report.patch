@@ -1,4 +1,4 @@
-From: developer <developer@mediatek.com>
+From: Paul-Louis Charrière <plcharriere@gmail.com>
 Date: Sat, 26 Sep 2026 16:24:07 +0900
 Subject: [PATCH] wifi: mt76: mt7996: take MT7990 TX rate from firmware report
 
@@ -22,7 +22,8 @@ Mbit/s until the station reassociated.  With WED, the same kind of status
 was seen replacing the cached HE80 rate.
 
 MediaTek's driver takes TX rates from the firmware report instead of TX
-status.  Do the same for MT7990: convert the full TX rate from the
+status.  The referenced rate-report work was authored by Benjamin Lin and
+Shayne Chen.  Do the same for MT7990: convert the full TX rate from the
 UNI_ALL_STA_TXRX_RATE report and stop TX status from overwriting it.  TX
 status statistics are unchanged, and MT7996 and MT7992 keep the current
 behaviour.
@@ -42,6 +43,7 @@ Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7
 Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0044-mtk-mt76-rework-statistics-report-for-mt7996.patch
 [plcharriere: limit the change to MT7990, preserve the existing statistics,
 and ignore only the initial legacy-rate placeholder]
+Assisted-by: Claude:claude-opus-5-5
 Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
 --- a/mt76.h
 +++ b/mt76.h
