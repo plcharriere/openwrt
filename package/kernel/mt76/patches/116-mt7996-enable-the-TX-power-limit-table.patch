@@ -1,0 +1,96 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 00:12:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: enable the TX power limit table
+
+The driver sends the per-rate power limits to the firmware, computed from
+the regulatory limit, the configured TX power and the limits of the
+device tree, but never tells the firmware to apply them.  The MT7990
+firmware then transmits at the power of the EEPROM whatever the limits
+are: the configured TX power has no effect and the regulatory limit is
+not enforced.
+
+Enable the limit table when a radio starts, as MediaTek's driver does.
+
+Based-on-patch-by: Shayne Chen <shayne.chen@mediatek.com>
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/22213a321b6dafb2a5e01def97363420e6e938fd/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0052-mtk-mt76-mt7996-add-testmode-support.patch
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/22213a321b6dafb2a5e01def97363420e6e938fd/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0054-mtk-mt76-add-debug-tools.patch
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/main.c   |  6 ++++++
+ mt7996/mcu.c    | 26 ++++++++++++++++++++++++++
+ mt7996/mcu.h    |  1 +
+ mt7996/mt7996.h |  2 ++
+ 4 files changed, 35 insertions(+)
+
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -34,6 +34,12 @@ int mt7996_run(struct mt7996_phy *phy)
+ 	if (ret)
+ 		return ret;
+ 
++	/* apply the power limits sent by mt7996_mcu_set_txpower_sku() */
++	ret = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_SKU_POWER_LIMIT_CTRL,
++					   true);
++	if (ret)
++		return ret;
++
+ 	set_bit(MT76_STATE_RUNNING, &phy->mt76->state);
+ 
+ 	ieee80211_queue_delayed_work(dev->mphy.hw, &phy->mt76->mac_work,
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -5804,6 +5804,32 @@ int mt7996_mcu_set_sniffer_mode(struct mt7996_phy *phy, bool enabled)
+ 				 sizeof(req), true);
+ }
+ 
++int mt7996_mcu_set_tx_power_ctrl(struct mt7996_phy *phy, u8 power_ctrl_id,
++				 u8 data)
++{
++	struct mt7996_dev *dev = phy->dev;
++	struct {
++		u8 _rsv[4];
++
++		__le16 tag;
++		__le16 len;
++
++		u8 power_ctrl_id;
++		u8 data;
++		u8 band_idx;
++		u8 rsv[1];
++	} __packed req = {
++		.tag = cpu_to_le16(power_ctrl_id),
++		.len = cpu_to_le16(sizeof(req) - 4),
++		.power_ctrl_id = power_ctrl_id,
++		.data = data,
++		.band_idx = phy->mt76->band_idx,
++	};
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(TXPOWER),
++				 &req, sizeof(req), false);
++}
++
+ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy)
+ {
+ #define TX_POWER_LIMIT_TABLE_RATE	0
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -1041,6 +1041,7 @@ enum {
+ };
+ 
+ enum {
++	UNI_TXPOWER_SKU_POWER_LIMIT_CTRL = 0,
+ 	UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL = 4,
+ };
+ 
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -834,6 +834,8 @@ int mt7996_mcu_get_chan_mib_info(struct mt7996_phy *phy, bool chan_switch);
+ int mt7996_mcu_get_temperature(struct mt7996_phy *phy);
+ int mt7996_mcu_set_thermal_throttling(struct mt7996_phy *phy, u8 state);
+ int mt7996_mcu_set_thermal_protect(struct mt7996_phy *phy, bool enable);
++int mt7996_mcu_set_tx_power_ctrl(struct mt7996_phy *phy, u8 power_ctrl_id,
++				 u8 data);
+ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy);
+ int mt7996_mcu_rdd_resume_tx(struct mt7996_phy *phy);
+ int mt7996_mcu_rdd_cmd(struct mt7996_dev *dev, int cmd, u8 rdd_idx, u8 val);
