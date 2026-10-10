@@ -546,7 +546,10 @@ function generate(config) {
 	append_vars(config, [ 'min_tx_power' ]);
 
 	/* hwmode, channel, op_class, ... */
-	append_vars(config, [ 'hw_mode', 'channel', 'rts_threshold', 'chanlist' ]);
+	append_vars(config, [ 'hw_mode', 'channel', 'chanlist' ]);
+	/* on a phy with radios, mac80211.sh sets it for the radio */
+	if (config.radio == null)
+		append_vars(config, [ 'rts_threshold' ]);
 	if (config.hw_mode in [ 'a', 'g' ] && config.require_mode in [ 'n', 'ac', 'ax' ]) {
 		let require_mode = { n: 'require_ht', ac: 'require_vht', ax: 'require_he' };
 
