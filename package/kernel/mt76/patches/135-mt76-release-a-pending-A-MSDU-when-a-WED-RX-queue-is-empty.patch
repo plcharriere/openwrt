@@ -1,0 +1,74 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 15 Oct 2026 13:05:00 +0900
+Subject: [PATCH] wifi: mt76: release a pending A-MSDU when a WED RX queue is
+ empty
+
+mt76_rx_release_burst() keeps the subframes of an A-MSDU until its last
+subframe arrives, or until the next frame of the same radio on that
+queue shows that the A-MSDU has ended.
+
+With WED, the subframes of flows that the PPE has bound are forwarded by
+the hardware and never reach the host. When the last subframe of an
+A-MSDU is one of them, the subframes that the host received wait for the
+next frame of that radio on that queue, which can take seconds when the
+clients send little to the host: a DNS query that a client sends in the
+same A-MSDU as TCP ACKs of an offloaded download is answered only when
+another frame arrives.
+
+Release the pending A-MSDUs of a WED RX queue when a poll finds the
+queue empty. A subframe that the hardware writes after that arrives on
+its own, carries the PN of the subframes before it and fails the PN
+check, as it does already when another frame arrives between two
+subframes.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/dma.c
++++ b/dma.c
+@@ -1112,6 +1112,14 @@ int mt76_dma_rx_poll(struct napi_struct
+ 
+ 	do {
+ 		cur = mt76_dma_rx_process(dev, &dev->q_rx[qid], budget - done);
++
++		/* WED can forward subframes of an A-MSDU in hardware, so the
++		 * last one may never reach the host: once the queue is empty,
++		 * pass on the subframes received so far
++		 */
++		if (!cur && mt76_queue_is_wed_rx(&dev->q_rx[qid]))
++			mt76_rx_release_pending_amsdu(dev, qid);
++
+ 		mt76_rx_poll_complete(dev, qid, napi);
+ 		done += cur;
+ 	} while (cur && done < budget);
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -956,6 +956,18 @@ static void mt76_rx_release_burst(struct
+ 		mt76_rx_release_amsdu(phy, q);
+ }
+ 
++void mt76_rx_release_pending_amsdu(struct mt76_dev *dev, enum mt76_rxq_id q)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
++		struct mt76_phy *phy = dev->phys[i];
++
++		if (phy && phy->rx_amsdu[q].head)
++			mt76_rx_release_amsdu(phy, q);
++	}
++}
++
+ void mt76_rx(struct mt76_dev *dev, enum mt76_rxq_id q, struct sk_buff *skb)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+--- a/mt76.h
++++ b/mt76.h
+@@ -1557,6 +1557,7 @@ static inline bool mt76_is_testmode_skb(
+ }
+ 
+ void mt76_rx(struct mt76_dev *dev, enum mt76_rxq_id q, struct sk_buff *skb);
++void mt76_rx_release_pending_amsdu(struct mt76_dev *dev, enum mt76_rxq_id q);
+ void mt76_tx(struct mt76_phy *dev, struct ieee80211_sta *sta,
+ 	     struct mt76_wcid *wcid, struct sk_buff *skb);
+ void mt76_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq);
