@@ -1,0 +1,234 @@
+From: Rex Lu <rex.lu@mediatek.com>
+Date: Fri, 7 Jun 2024 13:51:25 +0800
+Subject: [PATCH] mtk: mt76: mt7996: Fix inconsistent QoS mapping between SW and
+ HW
+
+Fix inconsistent QoS mapping between SW and HW.
+Specifically, the mapping from IP DSCP to IEEE 802.11 user priority may be customized.
+Therefore, driver needs to pass the mapping to HW, so that the QoS type of traffic can be mapped in a consistent manner for both SW and HW paths.
+
+Refactor mt7996_mcu_set_qos_map function.
+1. According to fw logic, it will fill the dscp value 0~63 correspond tid.
+for example:
+The last set is 48-56 in the default qos map from hostapd.
+And it will set tid 7. but 57-63 in original function will not fill any value,
+so it will set zero to fw. Once the value of dscp is 57. mac80211 will correspond to tid 7.
+and fw will correspond to tid 0.
+
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+
+sync mt7996_net_fill_forward_path
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/08196fa6e5d338ce88aa0002f781e2d24289b1f1/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0057-mtk-mt76-mt7996-Fix-inconsistent-QoS-mapping-between.patch
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+[plcharriere: port to upstream mt76, which has no set_qos_map op; send the
+map with the SDO command (tag UNI_CMD_SDO_SET_QOS_MAP) on chips without
+WA; fill the table once per vif and also program it when a link is set up,
+so that the firmware follows the cfg80211 default map when no QoS map is
+configured and gets the map back after a hardware restart; map AF31-AF33
+to UP 4 in the default table, as cfg80211_classify8021d() does; let the
+first matching exception and the lowest matching UP range win, as cfg80211
+does; leave out the TID of offloaded flows in
+mt7996_net_fill_forward_path(), which needs WED and PPE changes]
+Assisted-by: Claude:claude-opus-5-5
+Co-developed-by: Paul-Louis Charrière <plcharriere@gmail.com>
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1310,6 +1310,7 @@
+ 	MCU_EXT_CMD_GROUP_PRE_CAL_INFO = 0xab,
+ 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
+ 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
++	MCU_EXT_CMD_SET_QOS_MAP = 0xb4,
+ 	MCU_EXT_CMD_WF_RF_PIN_CTRL = 0xbd,
+ };
+ 
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -1094,6 +1094,7 @@
+ enum {
+ 	UNI_CMD_SDO_SET = 1,
+ 	UNI_CMD_SDO_QUERY,
++	UNI_CMD_SDO_SET_QOS_MAP = 4,
+ 	UNI_CMD_SDO_CP_MODE = 6,
+ };
+ 
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -115,6 +115,8 @@
+ 
+ /* NOTE: used to map mt76_rates. idx may change if firmware expands table */
+ #define MT7996_BASIC_RATES_TBL		31
++
++#define IP_DSCP_NUM			64
+ #define MT7996_BEACON_RATES_TBL		25
+ 
+ #define MT7996_THERMAL_THROTTLE_MAX	100
+@@ -362,6 +364,10 @@
+ 
+ 	u8 mld_group_idx;
+ 	u8 mld_remap_idx;
++
++	/* QoS map support */
++	bool qos_map_set;
++	u8 qos_map[IP_DSCP_NUM];
+ };
+ 
+ /* crash-dump */
+@@ -1041,6 +1047,10 @@
+ int mt7996_mcu_ps_leave(struct mt7996_dev *dev, struct mt7996_vif_link *link,
+ 			struct mt7996_sta_link *msta_link);
+ int mt7996_mcu_cp_support(struct mt7996_dev *dev, u8 mode);
++void mt7996_mcu_fill_qos_map(struct mt7996_vif *mvif,
++			     struct cfg80211_qos_map *usr_qos_map);
++int mt7996_mcu_set_qos_map(struct mt7996_dev *dev, struct mt7996_vif *mvif,
++			   struct mt7996_vif_link *link);
+ int mt7996_mcu_set_emlsr_mode(struct mt7996_dev *dev,
+ 			      struct ieee80211_vif *vif,
+ 			      struct ieee80211_sta *sta,
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -6000,6 +6000,84 @@
+ 				 &cp_mode, sizeof(cp_mode), true);
+ }
+ 
++void mt7996_mcu_fill_qos_map(struct mt7996_vif *mvif,
++			     struct cfg80211_qos_map *usr_qos_map)
++{
++	u8 *map = mvif->qos_map;
++	int i;
++
++	/* Default QoS map, defined in section 2.3 of RFC8325.
++	 * Three most significant bits of DSCP are used as UP.
++	 */
++	for (i = 0; i < IP_DSCP_NUM; ++i)
++		map[i] = i >> 3;
++
++	/* Recommended QoS map, defined in section 4 of RFC8325.
++	 * Used in cfg80211_classify8021d since kernel v6.8.
++	 */
++	map[10] = map[12] = map[14] = map[16] = 0;
++	map[18] = map[20] = map[22] = 3;
++	map[24] = map[26] = map[28] = map[30] = 4;
++	map[40] = 5;
++	map[44] = map[46] = 6;
++	map[48] = 7;
++
++	/* User-defined QoS map. As in cfg80211_classify8021d(), the first
++	 * matching exception and the lowest matching UP range win.
++	 */
++	if (usr_qos_map) {
++		for (i = IEEE80211_NUM_UPS - 1; i >= 0; i--) {
++			u8 low = usr_qos_map->up[i].low;
++			u8 high = usr_qos_map->up[i].high;
++
++			if (low < IP_DSCP_NUM && high < IP_DSCP_NUM && low <= high)
++				memset(map + low, i, high - low + 1);
++		}
++
++		for (i = usr_qos_map->num_des - 1; i >= 0; i--) {
++			u8 dscp = usr_qos_map->dscp_exception[i].dscp;
++			u8 up = usr_qos_map->dscp_exception[i].up;
++
++			if (dscp < IP_DSCP_NUM && up < IEEE80211_NUM_UPS)
++				map[dscp] = up;
++		}
++	}
++
++	mvif->qos_map_set = true;
++}
++
++int mt7996_mcu_set_qos_map(struct mt7996_dev *dev, struct mt7996_vif *mvif,
++			   struct mt7996_vif_link *link)
++{
++	struct {
++		u8 _rsv[4];
++
++		__le16 tag;
++		__le16 len;
++
++		struct {
++			u8 bss_idx;
++			u8 qos_map_enable;
++			u8 __rsv[2];
++			s8 qos_map[IP_DSCP_NUM];
++		} data;
++	} __packed req = {
++		.tag = cpu_to_le16(UNI_CMD_SDO_SET_QOS_MAP),
++		.len = cpu_to_le16(sizeof(req) - 4),
++		.data.bss_idx = link->mt76.idx,
++		.data.qos_map_enable = true,
++	};
++
++	memcpy(req.data.qos_map, mvif->qos_map, IP_DSCP_NUM);
++
++	if (!mt7996_has_wa(dev))
++		return mt76_mcu_send_msg(&dev->mt76, MCU_WA_UNI_CMD(SDO),
++					 &req, sizeof(req), false);
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_WA_EXT_CMD(SET_QOS_MAP),
++				 &req.data, sizeof(req.data), false);
++}
++
+ int mt7996_mcu_set_dup_wtbl(struct mt7996_dev *dev)
+ {
+ #define DUP_WTBL_NUM	80
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -401,6 +401,12 @@
+ 	mt7996_init_bitrate_mask(vif, link);
+ 
+ 	mt7996_mcu_add_bss_info(phy, vif, link_conf, mlink, msta_link, true);
++	if (vif->type != NL80211_IFTYPE_MONITOR && !mlink->offchannel) {
++		/* also restores the map after a hardware restart */
++		if (!mvif->qos_map_set)
++			mt7996_mcu_fill_qos_map(mvif, NULL);
++		mt7996_mcu_set_qos_map(dev, mvif, link);
++	}
+ 	/* defer the first STA_REC of BMC entry to BSS_CHANGED_BSSID for STA
+ 	 * interface, since firmware only records BSSID when the entry is new
+ 	 */
+@@ -3197,6 +3203,33 @@
+ 	return ret;
+ }
+ 
++static int
++mt7996_set_qos_map(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		   struct cfg80211_qos_map *qos_map)
++{
++	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
++	struct mt7996_dev *dev = mt7996_hw_dev(hw);
++	unsigned long valid_links = vif->valid_links ?: BIT(0);
++	unsigned int link_id;
++	int ret = 0;
++
++	mutex_lock(&dev->mt76.mutex);
++	mt7996_mcu_fill_qos_map(mvif, qos_map);
++	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		struct mt7996_vif_link *link = mt7996_vif_link(dev, vif, link_id);
++
++		if (!link)
++			continue;
++
++		ret = mt7996_mcu_set_qos_map(dev, mvif, link);
++		if (ret)
++			break;
++	}
++	mutex_unlock(&dev->mt76.mutex);
++
++	return ret;
++}
++
+ const struct ieee80211_ops mt7996_ops = {
+ 	.add_chanctx = mt76_add_chanctx,
+ 	.remove_chanctx = mt76_remove_chanctx,
+@@ -3220,6 +3253,7 @@
+ 	.set_key = mt7996_set_key,
+ 	.ampdu_action = mt7996_ampdu_action,
+ 	.set_rts_threshold = mt7996_set_rts_threshold,
++	.set_qos_map = mt7996_set_qos_map,
+ 	.wake_tx_queue = mt76_wake_tx_queue,
+ 	.hw_scan = mt76_hw_scan,
+ 	.cancel_hw_scan = mt76_cancel_hw_scan,

@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mt76
-PKG_RELEASE=1
+PKG_RELEASE:=2
 
 PKG_LICENSE:=BSD-3-Clause-Clear
 PKG_LICENSE_FILES:=
@@ -668,14 +668,35 @@ define KernelPackage/mt7925-firmware/install
 		$(1)/lib/firmware/mediatek/mt7925
 endef
 
+# MT7990 firmware of July 2026 from MediaTek's feed, until mt76 carries it
+MT7990_FW_URL:=https://raw.githubusercontent.com/mediatek/mtk-openwrt-feeds/e1d5a2d3f750976080b7b1559cabafe31322819f/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/src/firmware/mt7996
+
+define Download/mt7990-wm
+  URL:=$(MT7990_FW_URL)
+  URL_FILE:=mt7990_wm.bin
+  FILE:=mt7990_wm-20260720.bin
+  HASH:=e77b2015ea95f656dc6b9343b658fb4c154d1bbe13ef52fdeb7e52f84f95eed5
+endef
+$(eval $(call Download,mt7990-wm))
+
+define Download/mt7990-rom-patch
+  URL:=$(MT7990_FW_URL)
+  URL_FILE:=mt7990_rom_patch.bin
+  FILE:=mt7990_rom_patch-20260720.bin
+  HASH:=d406140359b085efee0576b94e93a532fcd9edd802d867c99a0bed08abd84fca
+endef
+$(eval $(call Download,mt7990-rom-patch))
+
 define KernelPackage/mt7990-firmware/install
 	$(INSTALL_DIR) $(1)/lib/firmware/mediatek/mt7996
 	cp \
 		$(PKG_BUILD_DIR)/firmware/mt7996/mt7990_eeprom.bin \
 		$(PKG_BUILD_DIR)/firmware/mt7996/mt7990_eeprom_2i5i.bin \
-		$(PKG_BUILD_DIR)/firmware/mt7996/mt7990_rom_patch.bin \
-		$(PKG_BUILD_DIR)/firmware/mt7996/mt7990_wm.bin \
 		$(1)/lib/firmware/mediatek/mt7996
+	cp $(DL_DIR)/mt7990_rom_patch-20260720.bin \
+		$(1)/lib/firmware/mediatek/mt7996/mt7990_rom_patch.bin
+	cp $(DL_DIR)/mt7990_wm-20260720.bin \
+		$(1)/lib/firmware/mediatek/mt7996/mt7990_wm.bin
 endef
 
 define KernelPackage/mt7992-firmware/install
